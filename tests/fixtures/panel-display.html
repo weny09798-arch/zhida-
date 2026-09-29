@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>采购面板布局验收</title>
+  <style>
+    body { margin: 0; background: #e5e7eb; font-family: -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+    #toolbar { position: sticky; top: 0; background: #111827; color: #fff; padding: 8px; display: flex; gap: 8px; }
+    #toolbar button { padding: 4px 10px; }
+    #m2-panel-root { width: 560px; max-height: none; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; margin: 16px; overflow: hidden; font-size: 13px; color: #111827; position: relative; }
+    #m2-panel-root .m2-header { background: #1f2937; color: #fff; padding: 12px 14px; }
+    #m2-panel-root .m2-body { padding: 10px; }
+    #m2-panel-root .m2-order { border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+    #m2-panel-root .m2-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+    #m2-panel-root .m2-item img { width: 40px; height: 40px; border-radius: 4px; background: #f3f4f6; }
+    #m2-panel-root .m2-item-info { flex: 1; min-width: 0; }
+    #m2-panel-root .m2-item-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #m2-panel-root .m2-binding { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 4px 0 4px 48px; font-size: 11px; }
+    #m2-panel-root .m2-binding-url { flex: 1; min-width: 0; color: #2563eb; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #m2-panel-root .m2-undo { background: #fff; color: #6b7280; border: 1px solid #d1d5db; border-radius: 4px; padding: 2px 6px; font-size: 11px; }
+    #m2-panel-root .m2-record-toggle { display: inline-flex; align-items: center; gap: 4px; margin: 6px 0 0 48px; background: #fff; color: #374151; border: 1px solid #d1d5db; border-radius: 6px; padding: 4px 8px; cursor: pointer; font-size: 12px; }
+    #m2-panel-root .m2-purchase-stack.is-collapsed .m2-purchase-record { display: none; }
+    #m2-panel-root .m2-purchase-record { display: grid; gap: 6px; min-width: 0; margin: 6px 0 8px 48px; padding: 8px; background: #f8fafc; border-radius: 8px; }
+    #m2-panel-root .m2-record-field { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 8px; align-items: start; }
+    #m2-panel-root .m2-record-label { color: #6b7280; }
+    #m2-panel-root .m2-record-value { min-width: 0; white-space: normal; overflow-wrap: anywhere; user-select: text; color: #111827; }
+    #m2-panel-root .m2-record-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <button type="button" data-width="420">420</button>
+    <button type="button" data-width="560">560</button>
+    <button type="button" data-width="800">800</button>
+    <span id="width-label">560px</span>
+  </div>
+  <div id="m2-panel-root">
+    <div class="m2-header"><b>M2 采购</b></div>
+    <div class="m2-body">
+      <div class="m2-order">
+        <div class="m2-item">
+          <img alt="">
+          <div class="m2-item-info">
+            <div class="m2-item-name" title="超长商品标题用于确认标题仍可省略，采购编号不能跟着省略">超长商品标题用于确认标题仍可省略，采购编号不能跟着省略</div>
+          </div>
+        </div>
+        <div class="m2-binding">
+          <span class="m2-binding-url" title="https://example.invalid/very/long/product/link/that/may/ellipsis">https://example.invalid/very/long/product/link/that/may/ellipsis</span>
+          <button class="m2-undo" type="button">解绑当前项</button>
+        </div>
+        <div class="m2-purchase-stack" id="purchase-stack">
+          <button class="m2-record-toggle" id="record-toggle" type="button" aria-expanded="true">▼ 收起采购记录（3）</button>
+          <div class="m2-purchase-record" data-case="known">
+            <div class="m2-record-field"><div class="m2-record-label">采购状态</div><div class="m2-record-value">已记录订单，等待发货</div></div>
+            <div class="m2-record-field"><div class="m2-record-label">采购订单号</div><div class="m2-record-value" data-raw="260929-123456789012345678901234567890">260929-123456789012345678901234567890</div></div>
+            <div class="m2-record-actions"><button class="m2-undo copy" type="button" data-copy="260929-123456789012345678901234567890">复制</button></div>
+            <div class="m2-record-field"><div class="m2-record-label">实付金额</div><div class="m2-record-value">¥19.80</div></div>
+            <div class="m2-record-field"><div class="m2-record-label">金额同步</div><div class="m2-record-value">本地已记录，后台待同步</div></div>
+            <div class="m2-record-field"><div class="m2-record-label">快递单号</div><div class="m2-record-value" data-raw="SF123456789012345678901234567890">SF123456789012345678901234567890（本地已记录，后台待同步）</div></div>
+            <div class="m2-record-actions"><button class="m2-undo copy" type="button" data-copy="SF123456789012345678901234567890">复制</button></div>
+            <div class="m2-record-field"><div class="m2-record-label">快递单号</div><div class="m2-record-value" data-raw="YT9988776655443322110099887766">YT9988776655443322110099887766（后台已确认）</div></div>
+            <div class="m2-record-actions"><button class="m2-undo copy" type="button" data-copy="YT9988776655443322110099887766">复制</button></div>
+            <div class="m2-record-field"><div class="m2-record-label">说明</div><div class="m2-record-value">金额本地已记录，后台待物流同步；物流待发货。这是一段很长的异常说明，用来确认说明文字会换行而不是被裁成省略号。</div></div>
+          </div>
+          <div class="m2-purchase-record" data-case="unknown">
+            <div class="m2-record-field"><div class="m2-record-label">实付金额</div><div class="m2-record-value">尚未采集</div></div>
+            <div class="m2-record-field"><div class="m2-record-label">金额同步</div><div class="m2-record-value">尚未采集</div></div>
+          </div>
+          <div class="m2-purchase-record" data-case="zero">
+            <div class="m2-record-field"><div class="m2-record-label">实付金额</div><div class="m2-record-value">¥0.00</div></div>
+          </div>
+        </div>
+    </div>
+  </div>
+  <script>
+    const panel = document.getElementById('m2-panel-root');
+    document.getElementById('toolbar').addEventListener('click', (event) => {
+      const width = event.target.getAttribute('data-width');
+      if (!width) return;
+      panel.style.width = width + 'px';
+      document.getElementById('width-label').textContent = width + 'px';
+    });
+    document.getElementById('record-toggle').addEventListener('click', () => {
+      const stack = document.getElementById('purchase-stack');
+      const toggle = document.getElementById('record-toggle');
+      const collapsed = stack.classList.toggle('is-collapsed');
+      const count = stack.querySelectorAll('.m2-purchase-record').length;
+      toggle.textContent = (collapsed ? '▶ 展开采购记录' : '▼ 收起采购记录') + '（' + count + '）';
+      toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    });
+    document.querySelectorAll('.copy').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const raw = button.getAttribute('data-copy');
+        try {
+          await navigator.clipboard.writeText(raw);
+          button.textContent = '已复制';
+        } catch (error) {
+          button.textContent = '复制失败';
+        }
+      });
+    });
+    window.checkRecordFit = function () {
+      return Array.from(document.querySelectorAll('.m2-record-value')).map((node) => ({
+        text: node.textContent,
+        clipped: node.scrollWidth > node.clientWidth + 1 || node.scrollHeight > node.clientHeight + 1,
+      }));
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "至达国际 采购助手",
+  "version": "0.1.0",
+  "description": "关联货源一键采购发货（至达国际）",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": [
+    "https://zhida.shopeeok.com/*",
+    "https://*.yangkeduo.com/*",
+    "https://*.pinduoduo.com/*",
+    "https://*.pdd.com/*",
+    "https://*.taobao.com/*",
+    "https://*.tmall.com/*",
+    "https://*.1688.com/*",
+    "https://mclient.alipay.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://zhida.shopeeok.com/*"],
+      "js": ["token_hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://zhida.shopeeok.com/*"],
+      "js": ["purchase-store.js", "binding-store.js", "content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.yangkeduo.com/*",
+        "https://*.pinduoduo.com/*",
+        "https://*.pdd.com/*",
+        "https://*.taobao.com/*",
+        "https://*.tmall.com/*",
+        "https://*.1688.com/*"
+      ],
+      "js": ["platform-collectors.js", "pdd-order-discovery.js", "pdd_order.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://mclient.alipay.com/h5pay/*"],
+      "js": ["alipay-result.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
