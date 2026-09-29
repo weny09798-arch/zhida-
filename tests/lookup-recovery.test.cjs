@@ -98,6 +98,113 @@ test('provisional detail cannot silently attach an unverified order', async () =
   assert.equal(app.state.m2Purchases[0].candidates[0].orderSn, 'PDD-123');
 });
 
+test('a paid order detail reached by this lookup is recorded without another click', async () => {
+  const now = Date.now();
+  const orderSn = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') + '-619566907750351';
+  const detailHref = 'https://mobile.yangkeduo.com/order.html?order_sn=' + orderSn;
+  const purchase = seedPurchase({
+    paymentReceipt: { status: 'succeeded', amountMinor: 199, observedAt: now },
+    purchaseIntent: { goodsId: '123', quantity: 1, submittedAt: now },
+  });
+  const app = harness(seed(purchase, { tabContextMap: { 9: {
+    purchaseId: 'P-1', purpose: 'collect_orders', platform: 'PINDUODUO',
+    lastStage: 'entering_detail', candidate: { orderSn, detailHref },
+  } } }));
+  const reply = await app.message({ type: 'm2_purchaseComplete', purchaseId: 'P-1', orderSn, price: 1.99 }, { id: 9, url: detailHref });
+  assert.equal(reply.ok, true);
+  assert.equal(app.state.m2Purchases[0].platformOrderSn, orderSn);
+  assert.equal(app.state.m2Purchases[0].amount.minor, 199);
+  const logistics = app.state.m2SyncTasks.find(task => task.id === 'logistics:P-1');
+  assert.ok(logistics.nextAt >= now + 2 * 60 * 60 * 1000);
+});
+
+test('same-day detail with a different paid amount stays unlinked', async () => {
+  const now = Date.now();
+  const orderSn = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') + '-619566907750351';
+  const detailHref = 'https://mobile.yangkeduo.com/order.html?order_sn=' + orderSn;
+  const purchase = seedPurchase({ paymentReceipt: { status: 'succeeded', amountMinor: 199, observedAt: now }, purchaseIntent: { submittedAt: now } });
+  const app = harness(seed(purchase, { tabContextMap: { 9: {
+    purchaseId: 'P-1', purpose: 'collect_orders', lastStage: 'entering_detail',
+    candidate: { orderSn, detailHref },
+  } } }));
+  const reply = await app.message({ type: 'm2_purchaseComplete', purchaseId: 'P-1', orderSn, price: 0.70 }, { id: 9, url: detailHref });
+  assert.equal(reply.ok, false);
+  assert.equal(app.state.m2Purchases[0].platformOrderSn, null);
+  assert.equal(app.state.m2Purchases[0].amount, undefined);
+});
+
+test('an existing single pending candidate is rechecked and then recorded automatically', async () => {
+  const now = Date.now();
+  const orderSn = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') + '-619566907750351';
+  const detailHref = 'https://mobile.yangkeduo.com/order.html?order_sn=' + orderSn;
+  const purchase = seedPurchase({
+    paymentReceipt: { status: 'succeeded', amountMinor: 199, observedAt: now },
+    purchaseIntent: { submittedAt: now },
+    collection: { stage: 'awaiting_choice', reason: '订单详情已打开，请核对后点选对应订单', updatedAt: now },
+    candidates: [{ orderSn, detailHref }],
+  });
+  const app = harness(seed(purchase));
+  app.handlers.alarm({ name: 'autoCollect' });
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(app.created[0].url, detailHref);
+  assert.equal(app.state.m2Purchases[0].collection.stage, 'rechecking_candidate');
+  const reply = await app.message({ type: 'm2_purchaseComplete', purchaseId: 'P-1', orderSn, price: 1.99 }, { id: app.created[0].id, url: detailHref });
+  assert.equal(reply.ok, true);
+  assert.equal(app.state.m2Purchases[0].platformOrderSn, orderSn);
+});
+
+test('an existing ten-minute logistics task is postponed to the new two-hour interval', async () => {
+  const now = Date.now();
+  const purchase = seedPurchase({ platformOrderSn: 'PDD-123', logisticsSync: 'not_shipped', amount: { minor: 199 }, collection: { stage: 'amount_confirmed' } });
+  const app = harness(seed(purchase, { m2SyncTasks: [{
+    id: 'logistics:P-1', purchaseId: 'P-1', kind: 'logistics', status: 'pending', nextAt: now + 10 * 60 * 1000,
+  }] }));
+  app.handlers.alarm({ name: 'autoCollect' });
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.ok(app.state.m2SyncTasks[0].nextAt >= now + 2 * 60 * 60 * 1000);
+  assert.equal(app.created.length, 0);
+});
+
+test('a confirmed tracking number stops the pending automatic logistics check', async () => {
+  const purchase = seedPurchase({ platformOrderSn: 'PDD-123', logisticsSync: 'confirmed', amount: { minor: 199 }, collection: { stage: 'amount_confirmed' } });
+  const app = harness(seed(purchase, {
+    m2LogisticsIntervalVersion: 2,
+    m2SyncTasks: [{ id: 'logistics:P-1', purchaseId: 'P-1', kind: 'logistics', status: 'pending', nextAt: 0 }],
+  }));
+  app.handlers.alarm({ name: 'autoCollect' });
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(app.created.length, 0);
+  assert.equal(app.state.m2SyncTasks[0].status, 'confirmed');
+});
+
+test('a paused lookup is actually restarted by the retry button', async () => {
+  const purchase = seedPurchase({ collection: { stage: 'needs_review', reason: '拼多多账号无法确认' } });
+  const app = harness(seed(purchase, { m2SyncTasks: [{
+    id: 'order_identity:P-1', purchaseId: 'P-1', kind: 'order_identity', status: 'paused', nextAt: 0,
+  }] }));
+  const reply = await app.message({ type: 'm2_retryCollection', purchaseId: 'P-1' });
+  assert.equal(reply.ok, true);
+  assert.equal(app.state.m2Purchases[0].collection.stage, 'awaiting_order_detail');
+  assert.equal(app.created.length, 1);
+  assert.match(app.created[0].url, /orders\.html/);
+});
+
+test('a list candidate with matching paid amount is opened for detail verification when account id is absent', async () => {
+  const now = Date.now();
+  const orderSn = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') + '-619566907750351';
+  const detailHref = 'https://mobile.yangkeduo.com/order.html?order_sn=' + orderSn;
+  const purchase = seedPurchase({
+    paymentReceipt: { status: 'succeeded', amountMinor: 78, observedAt: now },
+    purchaseIntent: { goodsId: '123', quantity: 1, submittedAt: now },
+  });
+  const app = harness(seed(purchase, { tabContextMap: { 9: { purchaseId: 'P-1', purpose: 'collect_orders', listTarget: '待分享' } } }));
+  const reply = await app.message({ type: 'm2_orderCandidates', purchaseId: 'P-1', listTarget: '待分享', searchComplete: true,
+    cards: [{ orderSn, goodsId: '', accountId: '', payMinor: 78, status: '待分享', detailHref }] });
+  assert.equal(reply.status, 'inspect');
+  assert.equal(app.state.m2Purchases[0].platformOrderSn, null);
+  assert.equal(app.state.tabContextMap[9].candidate.orderSn, orderSn);
+});
+
 test('a non-collector detail cannot save an amount for a different order', async () => {
   const app = harness(seed(seedPurchase({ platformOrderSn: 'PDD-123' })));
   const reply = await app.message({ type: 'm2_updatePrice', purchaseId: 'P-1', orderSn: 'OTHER', price: 0.61 });
@@ -124,7 +231,7 @@ test('a detail page from an earlier purchase is skipped and lookup returns to th
   const app = harness(seed(current, {
     m2Purchases: [previous, current],
     m2PurchaseMeta: { version: 1, migrated: true },
-    tabContextMap: { 9: { purchaseId: 'P-NEW', purpose: 'collect_orders', createdByExtension: true, platform: 'PINDUODUO' } },
+    tabContextMap: { 9: { purchaseId: 'P-NEW', purpose: 'collect_orders', createdByExtension: true, platform: 'PINDUODUO', candidate: { cardFingerprint: 'old-card' } } },
   }));
   const reply = await app.message({ type: 'm2_purchaseComplete', orderSn: 'PDD-OLD', price: 0.70, purchaseId: 'P-NEW' }, { id: 9, url: 'https://mobile.yangkeduo.com/order.html?order_sn=PDD-OLD' });
   assert.equal(reply.ok, true);
@@ -133,6 +240,7 @@ test('a detail page from an earlier purchase is skipped and lookup returns to th
   assert.equal(app.state.m2Purchases[1].platformOrderSn, null);
   assert.equal(app.state.m2Purchases[1].amount, undefined);
   assert.equal(app.state.m2Purchases[1].candidates.length, 0);
+  assert.deepEqual(app.state.m2Purchases[1].skippedCardFingerprints, ['old-card']);
   assert.equal(app.state.tabContextMap[9], undefined);
   assert.equal(app.created.some(tab => /orders\.html/.test(tab.url)), true);
 });
@@ -176,12 +284,13 @@ test('an unresolved identity task does not reopen a page while awaiting a choice
 });
 
 test('new order detail tab inherits only provisional collector context from its opener', async () => {
-  const app = harness(seed(seedPurchase(), { tabContextMap: { 9: { purchaseId: 'P-1', purpose: 'collect_orders', candidate: { orderSn: 'PDD-123' } } } }));
+  const app = harness(seed(seedPurchase(), { tabContextMap: { 9: { purchaseId: 'P-1', purpose: 'collect_orders', candidate: { orderSn: 'PDD-123', cardFingerprint: 'old-card' } } } }));
   app.tabs.set(20, { id: 20, openerTabId: 9, url: 'https://mobile.yangkeduo.com/order.html?order_sn=PDD-123' });
   app.handlers.created({ id: 20, openerTabId: 9, url: 'https://mobile.yangkeduo.com/order.html?order_sn=PDD-123' });
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(app.state.tabContextMap[20].purchaseId, 'P-1');
   assert.equal(app.state.tabContextMap[20].purpose, 'collect_orders');
+  assert.equal(app.state.tabContextMap[20].candidate.cardFingerprint, 'old-card');
   assert.equal(app.state.tabContextMap[20].createdByExtension, false);
   app.tabs.set(21, { id: 21, openerTabId: 9, url: 'https://mobile.yangkeduo.com/order.html?order_sn=OTHER' });
   app.handlers.created({ id: 21, openerTabId: 9, url: 'https://mobile.yangkeduo.com/order.html?order_sn=OTHER' });

@@ -117,6 +117,7 @@
         collection: { stage: 'idle', reason: '', updatedAt: now },
         purchaseIntent: null,
         candidates: [],
+        skippedCardFingerprints: [],
         detailHref: '',
         platformOrderSn: null,
         amount: null,
@@ -290,6 +291,7 @@
           row.logisticsSync = row.logisticsSync === 'confirmed' ? 'confirmed' : 'not_shipped';
           row.collection = { stage: 'order_linked', reason: '', updatedAt: Date.now() };
           row.candidates = [];
+          row.skippedCardFingerprints = [];
           row.updatedAt = Date.now();
           await save(state);
           return { ok: true, purchase: row };
@@ -308,6 +310,19 @@
             listTarget: listTarget || '',
             updatedAt: Date.now(),
           };
+          row.updatedAt = Date.now();
+          await save(state);
+          return row;
+        });
+      },
+
+      skipCard: function (purchaseId, fingerprint) {
+        return run(async function () {
+          const state = await load();
+          const row = state.purchases.find(function (item) { return item.purchaseId === purchaseId; });
+          if (!row || !fingerprint) return row || null;
+          const previous = row.skippedCardFingerprints || [];
+          row.skippedCardFingerprints = previous.concat([String(fingerprint)]).slice(-10);
           row.updatedAt = Date.now();
           await save(state);
           return row;

@@ -69,7 +69,25 @@
     const claimed = {};
     (opts.claimedOrderSns || []).forEach(function (sn) { claimed[sn] = true; });
     const list = cards || [];
-    if (!wanted.accountId) return { status: 'account_unknown', matches: [] };
+    if (!wanted.accountId) {
+      const paidMinor = opts.paidMinor == null ? null : Number(opts.paidMinor);
+      const paidCandidates = list.filter(function (card) {
+        if (!card || !card.orderSn || claimed[card.orderSn] || !isPayableStatus(card.status)) return false;
+        if (wanted.goodsId && card.goodsId && wanted.goodsId !== card.goodsId) return false;
+        if (paidMinor == null || card.payMinor == null || Number(card.payMinor) !== paidMinor) return false;
+        const detail = absoluteOrderHref(card.detailHref || '');
+        if (!detail || new URL(detail).searchParams.get('order_sn') !== card.orderSn) return false;
+        const date = String(card.orderSn).match(/^(\d{6})-\d{15}$/);
+        const times = [wanted.submittedAt, wanted.paidAt].filter(Boolean);
+        return !!date && times.some(function (at) {
+          return new Date(Number(at) + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') === date[1];
+        });
+      });
+      if (!opts.searchComplete) return { status: 'incomplete', matches: paidCandidates };
+      if (paidCandidates.length === 1) return { status: 'inspect', matches: paidCandidates };
+      if (paidCandidates.length > 1) return { status: 'choose', matches: paidCandidates };
+      return { status: 'none', matches: [] };
+    }
     if (list.length && list.every(function (card) { return card.accountId && card.accountId !== wanted.accountId; })) {
       return { status: 'account_changed', matches: [] };
     }
@@ -212,15 +230,30 @@
         return other !== node && node.contains && node.contains(other);
       });
     });
-    if (leaves.length !== 1) return null;
-    const card = leaves[0];
+    const visible = leaves.filter(function (node) {
+      const fingerprint = (node.innerText || '').replace(/\s+/g, '').slice(0, 400);
+      const skipped = context && Array.isArray(context.skippedCardFingerprints) ? context.skippedCardFingerprints : [];
+      if (fingerprint && skipped.indexOf(fingerprint) !== -1) return false;
+      const href = hrefFrom(node);
+      let orderSn = '';
+      try { orderSn = href ? new URL(href).searchParams.get('order_sn') || '' : ''; } catch (e) {}
+      const claimed = context && Array.isArray(context.claimedOrderSns) ? context.claimedOrderSns : [];
+      if (orderSn && claimed.indexOf(orderSn) !== -1) return false;
+      const expected = context && context.paymentMinor;
+      const paid = (node.innerText || '').match(/实付\s*[¥￥]\s*(\d+(?:\.\d+)?)/);
+      if (expected != null && paid && Math.round(Number(paid[1]) * 100) !== Number(expected)) return false;
+      return true;
+    });
+    if (visible.length !== 1) return null;
+    const card = visible[0];
+    const cardFingerprint = (card.innerText || '').replace(/\s+/g, '').slice(0, 400);
     const href = hrefFrom(card);
     if (href) {
       let orderSn = '';
       try { orderSn = new URL(href).searchParams.get('order_sn') || ''; } catch (e) {}
       const claimed = context && Array.isArray(context.claimedOrderSns) ? context.claimedOrderSns : [];
       if (orderSn && claimed.indexOf(orderSn) !== -1) return null;
-      return { href: href, node: null, orderSn: orderSn };
+      return { href: href, node: null, orderSn: orderSn, cardFingerprint: cardFingerprint };
     }
     let title = null;
     if (card.querySelectorAll) {
@@ -244,8 +277,8 @@
         }
       });
     }
-    if (image) return { href: '', node: image };
-    return title ? { href: '', node: title.node } : null;
+    if (image) return { href: '', node: image, cardFingerprint: cardFingerprint };
+    return title ? { href: '', node: title.node, cardFingerprint: cardFingerprint } : null;
   }
 
   function shareListVisible(doc) {
@@ -283,7 +316,7 @@
       timeout = setTimeout(function () { finish(null); }, 1200);
       chrome.runtime.sendMessage({
         type: 'm2_collectionProgress', purchaseId: ctx.purchaseId, stage: 'entering_detail',
-        candidate: { orderSn: orderSn, detailHref: href },
+        candidate: { orderSn: orderSn, detailHref: href, cardFingerprint: entry.cardFingerprint || '' },
       }, finish);
     });
   }
@@ -371,6 +404,11 @@
       if (!resp || !resp.ok) {
         chrome.runtime.sendMessage({ type: 'm2_collectionPaused', purchaseId: ctx.purchaseId,
           reason: (resp && resp.error) || '订单列表候选未能保存，请检查查单状态' });
+        return;
+      }
+      if (resp && resp.status === 'inspect' && resp.detailHref) {
+        window.__m2CollectDone = true;
+        location.href = resp.detailHref;
         return;
       }
       if (resp && (resp.status === 'unique' || resp.status === 'choose')) {

@@ -749,6 +749,7 @@
             chrome.runtime.sendMessage({ type: 'm2_retryCollection', purchaseId: purchase.purchaseId }, (resp) => {
               retryBtn.disabled = false;
               if (!resp || !resp.ok) alert('补采失败：' + ((resp && resp.error) || '未知错误'));
+              else retryBtn.textContent = '补采已启动';
             });
           });
           actions.appendChild(retryBtn);

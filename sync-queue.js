@@ -80,6 +80,23 @@
         });
       },
 
+      postponeLogistics: function (nextAt) {
+        return run(async function () {
+          const tasks = await load();
+          tasks.forEach(function (task) {
+            if (task.kind !== 'logistics' || !String(task.id).startsWith('logistics:')
+                || task.status === 'confirmed' || task.status === 'paused') return;
+            task.nextAt = Math.max(Number(task.nextAt) || 0, nextAt);
+            if (task.status === 'leased') {
+              task.status = 'pending';
+              task.leaseUntil = 0;
+            }
+          });
+          await save(tasks);
+          return tasks;
+        });
+      },
+
       retry: function (id, nextAt, reason) {
         return run(async function () {
           const tasks = await load();

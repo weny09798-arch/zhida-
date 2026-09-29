@@ -76,6 +76,34 @@ test('runCollect skips a sole card whose order number belongs to an earlier purc
   } });
 });
 
+test('runCollect opens the current paid card after excluding the old claimed card', async () => {
+  const currentUrl = 'https://mobile.yangkeduo.com/order.html?order_sn=260929-619566907750351';
+  const oldCard = '<div class="order-card">待分享，差1人 <a href="' + DETAIL_URL + '">旧商品 ×1</a> 实付 ¥0.70</div>';
+  const currentCard = '<div class="order-card">待分享，差1人 <a href="' + currentUrl + '">新商品 ×1</a> 实付 ¥0.78</div>';
+  await run(page([oldCard, currentCard]), { exercise: async state => {
+    await collect({ paymentMinor: 78, claimedOrderSns: ['260929-041041324390351'] });
+    assert.equal(state.href, currentUrl);
+  } });
+});
+
+test('runCollect does not reopen a linkless card already identified as an old order', async () => {
+  const oldText = '待分享，差1人 旧商品 ×1 实付 ¥0.78';
+  const currentText = '待分享，差1人 新商品 ×1 实付 ¥0.78';
+  const document = page([
+    '<div class="order-card">' + oldText + '<img alt="旧商品"></div>',
+    '<div class="order-card">' + currentText + '<img alt="新商品"></div>',
+  ]);
+  let oldClicks = 0;
+  let currentClicks = 0;
+  document.querySelector('img[alt="旧商品"]').click = () => { oldClicks++; };
+  document.querySelector('img[alt="新商品"]').click = () => { currentClicks++; };
+  await run(document, { exercise: async () => {
+    await collect({ paymentMinor: 78, skippedCardFingerprints: [oldText.replace(/\s+/g, '')] });
+    assert.equal(oldClicks, 0);
+    assert.equal(currentClicks, 1);
+  } });
+});
+
 test('runCollect clicks a linkless product image once and waits for route progress', async () => {
   const document = page([card('牙签蛋糕 ×1 <img alt="牙签蛋糕">')]);
   let clicks = 0;

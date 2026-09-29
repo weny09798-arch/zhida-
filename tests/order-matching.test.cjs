@@ -85,3 +85,19 @@ test('the same amount alone does not choose the first card', () => {
   assert.equal(result.status, 'unique');
   assert.equal(result.matches[0].orderSn, '260929-222222222222222');
 });
+
+test('a missing account id can inspect one recent paid candidate without claiming it from the list', () => {
+  const now = Date.now();
+  const orderSn = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') + '-619566907750351';
+  const result = discovery.matchCandidates({ goodsId: 'G1', submittedAt: now }, [card({
+    orderSn, goodsId: '', accountId: '', skuId: '', createdAt: null, payMinor: 78,
+    detailHref: 'https://mobile.yangkeduo.com/order.html?order_sn=' + orderSn,
+  })], { searchComplete: true, paidMinor: 78, claimedOrderSns: [] });
+  assert.equal(result.status, 'inspect');
+  assert.equal(result.matches[0].orderSn, orderSn);
+});
+
+test('a missing account id with no matching order keeps searching instead of pausing', () => {
+  const result = discovery.matchCandidates({ goodsId: 'G1' }, [], { searchComplete: true, paidMinor: 78, claimedOrderSns: [] });
+  assert.equal(result.status, 'none');
+});
