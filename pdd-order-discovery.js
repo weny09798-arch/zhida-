@@ -194,7 +194,7 @@
     return found;
   }
 
-  function orderEntry(doc, listTarget) {
+  function orderEntry(doc, listTarget, context) {
     const root = doc || (typeof document !== 'undefined' ? document : null);
     if (!root || !root.querySelectorAll) return null;
     const cards = [];
@@ -215,7 +215,13 @@
     if (leaves.length !== 1) return null;
     const card = leaves[0];
     const href = hrefFrom(card);
-    if (href) return { href: href, node: null };
+    if (href) {
+      let orderSn = '';
+      try { orderSn = new URL(href).searchParams.get('order_sn') || ''; } catch (e) {}
+      const claimed = context && Array.isArray(context.claimedOrderSns) ? context.claimedOrderSns : [];
+      if (orderSn && claimed.indexOf(orderSn) !== -1) return null;
+      return { href: href, node: null, orderSn: orderSn };
+    }
     let title = null;
     if (card.querySelectorAll) {
       card.querySelectorAll('div, span, p, a').forEach(function (node) {
@@ -329,7 +335,7 @@
     } else {
       try { sessionStorage.removeItem('m2_share_tab_tries'); } catch (e) {}
     }
-    const entry = orderEntry(document, listTarget);
+    const entry = orderEntry(document, listTarget, ctx);
     const state = savedOpenState();
     const now = Date.now();
     if (state && state.purchaseId === ctx.purchaseId && state.listTarget === listTarget) {

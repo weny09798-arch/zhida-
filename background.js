@@ -464,6 +464,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: '采集页没有对上采购记录' });
           return;
         }
+        if (msg.candidate && msg.candidate.orderSn) {
+          const owners = await purchaseStore.findByPlatformOrder('PINDUODUO', msg.candidate.orderSn);
+          if (owners.some(function (row) { return row.purchaseId !== msg.purchaseId; })) {
+            sendResponse({ ok: false, error: '该订单号已关联到上一笔采购，已跳过此详情页' });
+            return;
+          }
+        }
         const stage = msg.stage === 'entering_detail' ? 'entering_detail' : 'opening_list';
         const candidate = msg.candidate && msg.candidate.orderSn ? [{ orderSn: msg.candidate.orderSn, detailHref: msg.candidate.detailHref || '' }] : [];
         await purchaseStore.saveCandidates(msg.purchaseId, candidate, stage, stage === 'entering_detail' ? '正在进入订单详情，核对归属' : '正在打开订单列表', tabCtx.listTarget);
@@ -497,7 +504,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const claim = await purchaseStore.claimCandidate(msg.purchaseId, { orderSn: msg.orderSn, detailHref: msg.detailHref || '' });
         if (!claim.ok) {
-          sendResponse({ ok: false, error: '这张订单没能记到当前采购' });
+          const error = claim.reason === 'conflict'
+            ? '该订单号已关联到另一笔采购，不能重复绑定；请重新查找本次订单'
+            : '当前采购记录已变化或订单号无效，请刷新后重试';
+          sendResponse({ ok: false, error: error });
           return;
         }
         await syncQueue.confirm('order_identity:' + msg.purchaseId);
@@ -542,6 +552,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         const purchase = await purchaseStore.get(purchaseId);
         if (tabCtx.purpose === 'collect_orders' && (!purchase || purchase.platformOrderSn !== msg.orderSn)) {
+          const platform = (tabCtx && tabCtx.platform) || msg.platform || 'PINDUODUO';
+          const previousOwners = msg.orderSn ? await purchaseStore.findByPlatformOrder(platform, msg.orderSn) : [];
+          if (previousOwners.some(function (row) { return row.purchaseId !== purchaseId; })) {
+            const reason = '检测到的是上一笔采购订单，已跳过并继续查找本次订单';
+            await purchaseStore.saveCandidates(purchaseId, [], 'not_found', reason, tabCtx.listTarget);
+            const tabId = sender && sender.tab && sender.tab.id;
+            const stored = await chrome.storage.local.get('tabContextMap');
+            const map = stored.tabContextMap || {};
+            delete map[String(tabId)];
+            await chrome.storage.local.set({ tabContextMap: map });
+            if (tabCtx.createdByExtension && tabId != null && chrome.tabs.remove) {
+              try { await chrome.tabs.remove(tabId); } catch (e) {}
+            }
+            const taskId = 'order_identity:' + purchaseId;
+            await syncQueue.schedule({ id: taskId, purchaseId: purchaseId, kind: 'order_identity', nextAt: Date.now() });
+            await syncQueue.requeue(taskId, Date.now());
+            await autoCollect();
+            sendResponse({ ok: true, skipped: true, message: reason });
+            return;
+          }
           const candidate = { orderSn: msg.orderSn, detailHref: sender && sender.tab && sender.tab.url || (tabCtx.candidate && tabCtx.candidate.detailHref) || '' };
           if (purchase && !purchase.platformOrderSn && candidate.orderSn) {
             await purchaseStore.saveCandidates(purchaseId, [candidate], 'awaiting_choice', '订单详情已打开，请核对后点选对应订单', tabCtx.listTarget);
@@ -1055,6 +1085,9 @@ async function autoCollect() {
       }
       const tab = await chrome.tabs.create({ url: url, active: false });
       if (tab && tab.id) {
+        const claimedOrderSns = rows.filter(function (item) {
+          return item.platform === 'PINDUODUO' && item.platformOrderSn;
+        }).map(function (item) { return item.platformOrderSn; });
         await rememberTab(tab.id, {
           purchaseId: row.purchaseId,
           purpose: purpose,
@@ -1071,6 +1104,7 @@ async function autoCollect() {
           productUrl: row.productUrl || '',
           quantity: row.quantity || 1,
           listTarget: (row.collection && row.collection.listTarget) || '待分享',
+          claimedOrderSns: claimedOrderSns,
           createdByExtension: true,
           createdAt: now,
           lastStage: task.kind === 'order_identity' ? 'opening_list' : 'opening_detail',

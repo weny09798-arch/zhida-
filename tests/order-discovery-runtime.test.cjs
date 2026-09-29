@@ -51,8 +51,8 @@ async function run(document, options = {}) {
   }
 }
 
-function collect() {
-  return discovery.runCollect({ purchaseId: 'purchase-1', listTarget: '待分享', progress: {} });
+function collect(overrides = {}) {
+  return discovery.runCollect(Object.assign({ purchaseId: 'purchase-1', listTarget: '待分享', progress: {} }, overrides));
 }
 
 test('runCollect follows the only safe order detail link and reports entry progress', async () => {
@@ -62,6 +62,17 @@ test('runCollect follows the only safe order detail link and reports entry progr
     assert.equal(state.href, DETAIL_URL);
     assert.equal(state.messages.filter(m => m.type === 'm2_collectionProgress').length, 1);
     assert.equal(state.messages.find(m => m.type === 'm2_collectionProgress').candidate.orderSn, '260929-041041324390351');
+  } });
+});
+
+test('runCollect skips a sole card whose order number belongs to an earlier purchase', async () => {
+  const previousOrderSn = '260929-041041324390351';
+  const document = page([card('<a href="https://mobile.yangkeduo.com/order.html?order_sn=' + previousOrderSn + '">牙签蛋糕 ×1</a>')]);
+  await run(document, { exercise: async state => {
+    await collect({ claimedOrderSns: [previousOrderSn] });
+    assert.equal(state.href, LIST_URL);
+    assert.equal(state.messages.some(message => message.type === 'm2_collectionProgress'), false);
+    assert.equal(state.messages.some(message => message.type === 'm2_orderCandidates'), true);
   } });
 });
 

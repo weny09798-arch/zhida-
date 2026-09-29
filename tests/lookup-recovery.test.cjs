@@ -105,6 +105,38 @@ test('a non-collector detail cannot save an amount for a different order', async
   assert.equal(app.state.m2Purchases[0].amount, undefined);
 });
 
+test('choosing an order already linked to a prior purchase explains the conflict', async () => {
+  const previous = seedPurchase({ purchaseId: 'P-OLD', platformOrderSn: 'PDD-OLD' });
+  const current = seedPurchase({ purchaseId: 'P-NEW', orderSn: 'S-NEW', platformOrderSn: null });
+  const app = harness(seed(current, {
+    m2Purchases: [previous, current],
+    m2PurchaseMeta: { version: 1, migrated: true },
+  }));
+  const reply = await app.message({ type: 'm2_chooseCandidate', purchaseId: 'P-NEW', orderSn: 'PDD-OLD', detailHref: 'https://mobile.yangkeduo.com/order.html?order_sn=PDD-OLD' });
+  assert.equal(reply.ok, false);
+  assert.match(reply.error, /已关联.*采购/);
+  assert.equal(app.state.m2Purchases[1].platformOrderSn, null);
+});
+
+test('a detail page from an earlier purchase is skipped and lookup returns to the order list', async () => {
+  const previous = seedPurchase({ purchaseId: 'P-OLD', platformOrderSn: 'PDD-OLD' });
+  const current = seedPurchase({ purchaseId: 'P-NEW', orderSn: 'S-NEW', platformOrderSn: null });
+  const app = harness(seed(current, {
+    m2Purchases: [previous, current],
+    m2PurchaseMeta: { version: 1, migrated: true },
+    tabContextMap: { 9: { purchaseId: 'P-NEW', purpose: 'collect_orders', createdByExtension: true, platform: 'PINDUODUO' } },
+  }));
+  const reply = await app.message({ type: 'm2_purchaseComplete', orderSn: 'PDD-OLD', price: 0.70, purchaseId: 'P-NEW' }, { id: 9, url: 'https://mobile.yangkeduo.com/order.html?order_sn=PDD-OLD' });
+  assert.equal(reply.ok, true);
+  assert.equal(reply.skipped, true);
+  assert.match(reply.message, /上一笔采购/);
+  assert.equal(app.state.m2Purchases[1].platformOrderSn, null);
+  assert.equal(app.state.m2Purchases[1].amount, undefined);
+  assert.equal(app.state.m2Purchases[1].candidates.length, 0);
+  assert.equal(app.state.tabContextMap[9], undefined);
+  assert.equal(app.created.some(tab => /orders\.html/.test(tab.url)), true);
+});
+
 test('choosing a provisional candidate lets its detail confirm the 0.61 paid amount', async () => {
   const app = harness(seed(seedPurchase(), { tabContextMap: { 9: { purchaseId: 'P-1', purpose: 'collect_orders' } } }));
   const provisional = await app.message({ type: 'm2_purchaseComplete', orderSn: 'PDD-123', price: 0.61, purchaseId: 'P-1' }, { id: 9, url: 'https://mobile.yangkeduo.com/order.html?order_sn=PDD-123' });
