@@ -36,6 +36,15 @@
     } else if (stage === 'unlinked_payment') {
       label = '付款页未能关联';
       detail = (row.collection && row.collection.reason) || '支付页面没有对上本次采购';
+    } else if (stage === 'awaiting_choice') {
+      label = '采购订单待核对';
+      detail = (row.collection && row.collection.reason) || '请在候选订单里选择对应的一笔';
+    } else if (stage === 'paused') {
+      label = '查单已暂停';
+      detail = (row.collection && row.collection.reason) || '请检查拼多多订单页面后重试';
+    } else if (stage === 'opening_list' || stage === 'entering_detail') {
+      label = stage === 'opening_list' ? '正在查询订单' : '正在读取订单详情';
+      detail = (row.collection && row.collection.reason) || '';
     } else if (stage === 'needs_review') {
       label = '订单详情待核对';
       detail = row.reviewReason || (row.collection && row.collection.reason) || '支付金额和订单实付需要核对';

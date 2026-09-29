@@ -87,3 +87,20 @@ test('an unlinked payment page is named instead of being saved as paid', () => {
   });
   assert.match(text.label, /付款页未能关联/);
 });
+
+test('a candidate awaiting confirmation is visible even if the payment page was closed', () => {
+  const view = describePurchase({
+    status: 'opened',
+    collection: { stage: 'awaiting_choice', reason: '请核对这笔订单' },
+    candidates: [{ orderSn: 'PDD-123' }],
+  });
+  assert.match(view.label, /订单.*核对/);
+  assert.match(view.detail, /请核对/);
+  assert.equal(view.paid, false);
+});
+
+test('a stalled collection explains that collection paused', () => {
+  const view = describePurchase({ collection: { stage: 'paused', reason: '没有找到待分享标签' } });
+  assert.match(view.label, /暂停/);
+  assert.match(view.detail, /没有找到待分享标签/);
+});

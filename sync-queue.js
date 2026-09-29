@@ -80,6 +80,33 @@
         });
       },
 
+      retry: function (id, nextAt, reason) {
+        return run(async function () {
+          const tasks = await load();
+          const task = tasks.find(function (item) { return item.id === id; });
+          if (!task || task.status === 'confirmed') return task || null;
+          task.status = 'retrying';
+          task.nextAt = nextAt;
+          task.leaseUntil = 0;
+          task.lastError = reason || '';
+          await save(tasks);
+          return task;
+        });
+      },
+
+      pause: function (id, reason) {
+        return run(async function () {
+          const tasks = await load();
+          const task = tasks.find(function (item) { return item.id === id; });
+          if (!task || task.status === 'confirmed') return task || null;
+          task.status = 'paused';
+          task.leaseUntil = 0;
+          task.lastError = reason || '';
+          await save(tasks);
+          return task;
+        });
+      },
+
       fail: function (id, result, now) {
         return run(async function () {
           const tasks = await load();
@@ -118,7 +145,7 @@
           const wanted = {};
           (ids || []).forEach(function (id) { wanted[id] = true; });
           tasks.forEach(function (item) {
-            if (!wanted[item.id]) return;
+            if (!wanted[item.id] || (item.status !== 'pending' && item.status !== 'retrying' && item.status !== 'leased')) return;
             item.status = 'leased';
             item.leaseUntil = now + (leaseMs || 60000);
           });

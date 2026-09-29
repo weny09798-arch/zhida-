@@ -174,8 +174,11 @@
   }
 
   function absoluteOrderHref(href) {
-    if (!/order_sn=/.test(href || '')) return '';
-    try { return new URL(href, 'https://mobile.yangkeduo.com').href; } catch (e) { return ''; }
+    try {
+      const url = new URL(href, 'https://mobile.yangkeduo.com');
+      if (url.origin !== 'https://mobile.yangkeduo.com' || !/\/order\.html$/.test(url.pathname) || !url.searchParams.get('order_sn')) return '';
+      return url.href;
+    } catch (e) { return ''; }
   }
 
   function hrefFrom(node) {
@@ -222,7 +225,6 @@
         if (!title || text.length < title.length) title = { node: node, length: text.length };
       });
     }
-    if (title) return { href: '', node: title.node };
     let image = null;
     let imageScore = -1;
     if (card.querySelectorAll) {
@@ -236,28 +238,8 @@
         }
       });
     }
-    return image ? { href: '', node: image } : null;
-  }
-
-  function openMatchingCard(doc, listTarget) {
-    const root = doc || document;
-    if (!root || !root.querySelectorAll) return false;
-    let best = null;
-    root.querySelectorAll('div, a, li').forEach(function (node) {
-      const text = node.innerText || '';
-      if (!/实付/.test(text)) return;
-      if (listTarget === '待分享' && !shouldOpenCard(text)) return;
-      if (listTarget !== '待分享' && !/待发货/.test(text)) return;
-      const compact = text.replace(/\s+/g, '');
-      if (!compact || compact.length > 500) return;
-      if (!best || compact.length < best.compact.length) best = { node: node, compact: compact };
-    });
-    if (!best) return false;
-    try {
-      best.node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-    } catch (e) {}
-    if (typeof best.node.click === 'function') best.node.click();
-    return true;
+    if (image) return { href: '', node: image };
+    return title ? { href: '', node: title.node } : null;
   }
 
   function shareListVisible(doc) {
@@ -267,16 +249,46 @@
 
   function press(node) {
     if (!node) return;
-    try {
-      node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-    } catch (e) {}
     if (typeof node.click === 'function') node.click();
+    else if (typeof node.dispatchEvent === 'function') node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  }
+
+  function savedOpenState() {
+    try { return JSON.parse(sessionStorage.getItem('m2_open_entry_state') || 'null'); } catch (e) { return null; }
+  }
+
+  function saveOpenState(state) {
+    try { sessionStorage.setItem('m2_open_entry_state', JSON.stringify(state)); } catch (e) {}
+  }
+
+  function reportEntry(ctx, entry) {
+    const href = entry.href || '';
+    let orderSn = '';
+    try { orderSn = new URL(href).searchParams.get('order_sn') || ''; } catch (e) {}
+    return new Promise(function (resolve) {
+      let settled = false;
+      let timeout;
+      const finish = function (resp) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(resp && resp.ok ? { ok: true } : { ok: false, reason: (resp && resp.error) || '进入详情前无法保存查单进度' });
+      };
+      timeout = setTimeout(function () { finish(null); }, 1200);
+      chrome.runtime.sendMessage({
+        type: 'm2_collectionProgress', purchaseId: ctx.purchaseId, stage: 'entering_detail',
+        candidate: { orderSn: orderSn, detailHref: href },
+      }, finish);
+    });
   }
 
   async function runCollect(ctx) {
     const listTarget = (ctx && ctx.listTarget) || '待分享';
     const kind = pageKind(location.href);
-    if (kind === 'order_detail') return;
+    if (kind === 'order_detail') {
+      try { sessionStorage.removeItem('m2_open_entry_state'); } catch (e) {}
+      return;
+    }
     const detected = activeListTab(document) || listTabFromUrl(location.href);
     const step = nextStep({
       kind: kind,
@@ -287,12 +299,19 @@
     if (step.action === 'click') {
       const control = findControl(step.text);
       if (!control) {
+        const key = 'm2_missing_control_' + ctx.purchaseId + '_' + step.text;
+        let tries = 0;
+        try { tries = Number(sessionStorage.getItem(key) || '0'); } catch (e) {}
+        if (tries < 3) {
+          try { sessionStorage.setItem(key, String(tries + 1)); } catch (e) {}
+          return;
+        }
         chrome.runtime.sendMessage({ type: 'm2_collectionPaused', purchaseId: ctx.purchaseId, reason: '没有找到「' + step.text + '」。请确认订单页已经打开' });
         return;
       }
+      try { sessionStorage.removeItem('m2_missing_control_' + ctx.purchaseId + '_' + step.text); } catch (e) {}
       press(control);
-      if (kind !== 'order_list') return;
-      await new Promise(function (resolve) { setTimeout(resolve, 700); });
+      return;
     }
     if (kind !== 'order_list') {
       if (step.action === 'stop') {
@@ -310,18 +329,26 @@
     } else {
       try { sessionStorage.removeItem('m2_share_tab_tries'); } catch (e) {}
     }
-    if (entry && entry.href) {
-      location.href = entry.href;
-      return;
-    }
-    if (entry && entry.node) {
-      let tries = 0;
-      try { tries = Number(sessionStorage.getItem('m2_open_entry_tries') || '0'); } catch (e) {}
-      if (tries < 2) {
-        try { sessionStorage.setItem('m2_open_entry_tries', String(tries + 1)); } catch (e) {}
-        press(entry.node);
+    const entry = orderEntry(document, listTarget);
+    const state = savedOpenState();
+    const now = Date.now();
+    if (state && state.purchaseId === ctx.purchaseId && state.listTarget === listTarget) {
+      if (now - state.lastAt < 2000) return;
+      if (state.attempts >= 2) {
+        chrome.runtime.sendMessage({ type: 'm2_collectionPaused', purchaseId: ctx.purchaseId, reason: '订单卡片已点击，但没有进入订单详情；请手动检查订单页' });
         return;
       }
+    }
+    if (entry) {
+      const progress = await reportEntry(ctx, entry);
+      if (!progress.ok) {
+        chrome.runtime.sendMessage({ type: 'm2_collectionPaused', purchaseId: ctx.purchaseId, reason: progress.reason });
+        return;
+      }
+      saveOpenState({ purchaseId: ctx.purchaseId, listTarget: listTarget, attempts: (state && state.purchaseId === ctx.purchaseId && state.listTarget === listTarget ? state.attempts : 0) + 1, lastAt: now });
+      if (entry.href) location.href = entry.href;
+      else press(entry.node);
+      return;
     }
     const cards = readCards(document);
     const progress = ctx.progress || {};
@@ -330,10 +357,16 @@
       type: 'm2_orderCandidates',
       purchaseId: ctx.purchaseId,
       cards: cards,
+      reason: cards.length ? '订单列表有多张或无法可靠区分的卡片' : '订单列表未找到可读取的详情入口，可能还在加载',
       listTarget: listTarget,
       searchComplete: !limited && !/加载中/.test(document.body ? document.body.innerText : ''),
       limitReached: limited,
     }, function (resp) {
+      if (!resp || !resp.ok) {
+        chrome.runtime.sendMessage({ type: 'm2_collectionPaused', purchaseId: ctx.purchaseId,
+          reason: (resp && resp.error) || '订单列表候选未能保存，请检查查单状态' });
+        return;
+      }
       if (resp && (resp.status === 'unique' || resp.status === 'choose')) {
         window.__m2CollectDone = true;
         return;

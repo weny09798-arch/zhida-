@@ -4,7 +4,7 @@
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.M2AlipayResult = api;
   if (typeof document !== 'undefined' && typeof location !== 'undefined' && /mclient\.alipay\.com$/i.test(location.hostname || '') && typeof chrome !== 'undefined' && chrome.runtime) {
-    watchPayment(api);
+    api.watchPayment();
   }
 })(typeof globalThis !== 'undefined' ? globalThis : {}, function () {
   function parseResult(text) {
@@ -37,26 +37,63 @@
   }
 
   function watchPayment(api) {
-    try { chrome.runtime.sendMessage({ type: 'm2_watchPaymentTab' }); } catch (e) {}
-    let inflight = false;
-    let savedKey = '';
-    function send() {
-      const result = api.parseResult(document.body ? document.body.innerText : '');
-      if (result.status !== 'succeeded' && result.status !== 'failed') return;
-      const key = result.status + ':' + String(result.amountMinor);
-      if (inflight || savedKey === key) return;
-      inflight = true;
-      chrome.runtime.sendMessage({ type: 'm2_paymentResult', result: result }, function (resp) {
-        inflight = false;
-        if (resp && resp.ok) savedKey = key;
-      });
+    function sender(buildMessage) {
+      let inFlight = false;
+      let retryTimer = null;
+      let savedKey = '';
+      let failures = 0;
+      function send() {
+        if (inFlight || retryTimer !== null) return;
+        const item = buildMessage();
+        if (!item || item.key === savedKey) return;
+        inFlight = true;
+        let finished = false;
+        const timeout = setTimeout(function () { finish(false); }, 3000);
+        function finish(ok) {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timeout);
+          inFlight = false;
+          if (ok) {
+            savedKey = item.key;
+            failures = 0;
+            send();
+          } else {
+            const delay = Math.min(30000, 500 * Math.pow(2, Math.min(failures++, 6)));
+            retryTimer = setTimeout(function () {
+              retryTimer = null;
+              send();
+            }, delay);
+          }
+        }
+        try {
+          chrome.runtime.sendMessage(item.message, function (response) {
+            finish(!chrome.runtime.lastError && !!(response && response.ok));
+          });
+        } catch (e) {
+          finish(false);
+        }
+      }
+      return send;
     }
-    send();
+    const register = sender(function () {
+      return { key: 'tab', message: { type: 'm2_watchPaymentTab' } };
+    });
+    const sendResult = sender(function () {
+      const result = api.parseResult(document.body ? document.body.innerText : '');
+      if (result.status !== 'succeeded' && result.status !== 'failed') return null;
+      return {
+        key: result.status + ':' + String(result.amountMinor),
+        message: { type: 'm2_paymentResult', result: result }
+      };
+    });
+    register();
+    sendResult();
     if (document.body && typeof MutationObserver !== 'undefined') {
-      const observer = new MutationObserver(function () { send(); });
+      const observer = new MutationObserver(function () { sendResult(); });
       observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     }
   }
 
-  return { parseResult: parseResult, resolvePaymentTarget: resolvePaymentTarget };
+  return { parseResult: parseResult, resolvePaymentTarget: resolvePaymentTarget, watchPayment: function () { watchPayment(this); } };
 });

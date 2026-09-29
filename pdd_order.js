@@ -39,6 +39,23 @@
     try { chrome.runtime.sendMessage({ type, ...payload }); } catch (e) {}
   }
 
+  function sendConfirmed(type, payload) {
+    return new Promise((resolve, reject) => {
+      if (!storageAvailable()) { reject(new Error('插件存储不可用')); return; }
+      let finished = false;
+      const timeout = setTimeout(() => finish(false), 3000);
+      function finish(ok) {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        if (ok) resolve();
+        else reject(new Error(type + ' 未保存，请重试'));
+      }
+      try { chrome.runtime.sendMessage({ type, ...payload }, (resp) => finish(!chrome.runtime.lastError && !!(resp && resp.ok))); }
+      catch (e) { finish(false); }
+    });
+  }
+
   // 精确获取「当前 tab」的采购上下文（按 tab.id，避免多单并发时全局 purchaseContext 被覆盖串单）
   function getMyContext() {
     return new Promise((resolve) => {
@@ -472,10 +489,10 @@
   }
 
   function rememberPurchaseIntent(ctx) {
-    if (!ctx || !ctx.purchaseId) return;
+    if (!ctx || !ctx.purchaseId) return Promise.reject(new Error('缺少采购编号'));
     const source = (ctx.productUrl || window.location.href || '');
     const goods = source.match(/goods_id=(\d+)/);
-    notify('m2_savePurchaseIntent', {
+    return sendConfirmed('m2_savePurchaseIntent', {
       purchaseId: ctx.purchaseId,
       intent: {
         goodsId: goods ? goods[1] : '',
@@ -494,13 +511,18 @@
     await sleep(400);
     await fillAddress(ctx && ctx.shopeeOrder);
     await selectAlipay();
-    await rememberPurchaseIntent(ctx);
+    try {
+      await rememberPurchaseIntent(ctx);
+      await sendConfirmed('m2_purchaseSubmitted', { purchaseId: ctx.purchaseId, orderSn: null });
+    } catch (e) {
+      window.__m2CheckoutDone = false;
+      throw e;
+    }
     await submitOrder();
     if (ctx) {
       ctx.currentStep = 'done';
       await setContext(ctx);
     }
-    notify('m2_purchaseSubmitted', { orderSn: null });
   }
 
   // 点「查看物流 / 物流信息」展开物流详情（拼多多、淘宝、1688 的运输单号默认折叠，不展开提取不到）

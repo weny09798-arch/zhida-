@@ -87,3 +87,40 @@ test('a leased task is not picked twice until the lease expires', async () => {
   const recovered = await queue.pick(2000, 2);
   assert.equal(recovered.length, 2);
 });
+
+test('finishing a failed collection attempt releases its lease and respects retry time', async () => {
+  const queue = createQueue(memory());
+  await queue.schedule({ id: 'order_identity:P-1', purchaseId: 'P-1', kind: 'order_identity', nextAt: 0 });
+  await queue.claim(['order_identity:P-1'], 1000, 120000);
+  await queue.retry('order_identity:P-1', 16000, '采集页已关闭');
+  assert.deepEqual((await queue.pick(15999, 2)).map((task) => task.id), []);
+  assert.deepEqual((await queue.pick(16000, 2)).map((task) => task.id), ['order_identity:P-1']);
+});
+
+test('a live collection attempt remains leased when only its wakeup time changes', async () => {
+  const queue = createQueue(memory());
+  await queue.schedule({ id: 'order_identity:P-1', purchaseId: 'P-1', kind: 'order_identity', nextAt: 0 });
+  await queue.claim(['order_identity:P-1'], 1000, 120000);
+  await queue.defer(['order_identity:P-1'], 16000);
+  assert.deepEqual(await queue.pick(16000, 2), []);
+});
+
+test('a task awaiting human choice cannot be picked until explicitly requeued', async () => {
+  const queue = createQueue(memory());
+  await queue.schedule({ id: 'order_identity:P-1', purchaseId: 'P-1', kind: 'order_identity', nextAt: 0 });
+  await queue.pause('order_identity:P-1', '请核对候选');
+  assert.deepEqual(await queue.pick(999999, 2), []);
+  await queue.requeue('order_identity:P-1', 0);
+  assert.equal((await queue.pick(0, 2)).length, 1);
+});
+
+test('refreshing a live collector lease cannot reactivate paused or confirmed work', async () => {
+  const queue = createQueue(memory());
+  await queue.schedule({ id: 'order_identity:P-1', purchaseId: 'P-1', kind: 'order_identity', nextAt: 0 });
+  await queue.schedule({ id: 'order_identity:P-2', purchaseId: 'P-2', kind: 'order_identity', nextAt: 0 });
+  await queue.pause('order_identity:P-1', '等待核对');
+  await queue.confirm('order_identity:P-2');
+  await queue.claim(['order_identity:P-1', 'order_identity:P-2'], 1000, 120000);
+  await queue.releaseExpired(122000);
+  assert.deepEqual(await queue.pick(122000, 2), []);
+});
