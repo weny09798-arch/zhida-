@@ -27,6 +27,17 @@ test('tracking number is not the purchase order number or a short mixed token', 
   assert.equal(collectors.extractTracking('', '订单编号：260929-123456789012345', '260929-123456789012345'), '');
 });
 
+test('Pinduoduo logistics page reads a carrier-labelled tracking number', () => {
+  const orderSn = '260929-619566907750351';
+  const page = '极兔速递: JT5531151004081 复制 订单编号: ' + orderSn + ' 已发货 商家已发货';
+  const tracking = collectors.extractTracking(
+    'https://mobile.yangkeduo.com/goods_express.html?order_sn=' + orderSn,
+    page,
+    orderSn
+  );
+  assert.equal(tracking, 'JT5531151004081');
+});
+
 test('paid amount labels with currency signs are supported', () => {
   for (const text of [
     '实付金额：￥1.21',

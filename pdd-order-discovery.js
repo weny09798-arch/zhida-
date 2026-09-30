@@ -225,8 +225,12 @@
       if (!compact || compact.length > 1500) return;
       cards.push(node);
     });
-    const leaves = cards.filter(function (node) {
-      return !cards.some(function (other) {
+    const actionable = cards.filter(function (node) {
+      return !!hrefFrom(node) || !!(node.querySelectorAll && node.querySelectorAll('img').length);
+    });
+    const candidates = actionable.length ? actionable : cards;
+    const leaves = candidates.filter(function (node) {
+      return !candidates.some(function (other) {
         return other !== node && node.contains && node.contains(other);
       });
     });
@@ -247,13 +251,15 @@
     if (visible.length !== 1) return null;
     const card = visible[0];
     const cardFingerprint = (card.innerText || '').replace(/\s+/g, '').slice(0, 400);
+    const paidText = (card.innerText || '').match(/实付\s*[¥￥]\s*(\d+(?:\.\d+)?)/);
+    const payMinor = paidText ? Math.round(Number(paidText[1]) * 100) : null;
     const href = hrefFrom(card);
     if (href) {
       let orderSn = '';
       try { orderSn = new URL(href).searchParams.get('order_sn') || ''; } catch (e) {}
       const claimed = context && Array.isArray(context.claimedOrderSns) ? context.claimedOrderSns : [];
       if (orderSn && claimed.indexOf(orderSn) !== -1) return null;
-      return { href: href, node: null, orderSn: orderSn, cardFingerprint: cardFingerprint };
+      return { href: href, node: null, orderSn: orderSn, cardFingerprint: cardFingerprint, payMinor: payMinor };
     }
     let title = null;
     if (card.querySelectorAll) {
@@ -277,13 +283,20 @@
         }
       });
     }
-    if (image) return { href: '', node: image, cardFingerprint: cardFingerprint };
-    return title ? { href: '', node: title.node, cardFingerprint: cardFingerprint } : null;
+    if (image) return { href: '', node: image, cardFingerprint: cardFingerprint, payMinor: payMinor };
+    return title ? { href: '', node: title.node, cardFingerprint: cardFingerprint, payMinor: payMinor } : null;
   }
 
-  function shareListVisible(doc) {
-    const text = doc && doc.body ? doc.body.innerText || '' : '';
-    return /待分享[，,]|差\d+人/.test(text);
+  function hasVisiblePaidCard(doc, listTarget, paymentMinor) {
+    if (!doc || !doc.querySelectorAll) return false;
+    return Array.from(doc.querySelectorAll('div, a, li')).some(function (node) {
+      const text = node.innerText || '';
+      if (!text || text.length > 1500) return false;
+      if (listTarget === '待分享' ? !/待分享/.test(text) : !/待发货/.test(text)) return false;
+      const paid = text.match(/实付\s*[¥￥]\s*(\d+(?:\.\d+)?)/);
+      if (!paid) return false;
+      return paymentMinor == null || Math.round(Number(paid[1]) * 100) === Number(paymentMinor);
+    });
   }
 
   function press(node) {
@@ -316,12 +329,36 @@
       timeout = setTimeout(function () { finish(null); }, 1200);
       chrome.runtime.sendMessage({
         type: 'm2_collectionProgress', purchaseId: ctx.purchaseId, stage: 'entering_detail',
-        candidate: { orderSn: orderSn, detailHref: href, cardFingerprint: entry.cardFingerprint || '' },
+        candidate: { orderSn: orderSn, detailHref: href, cardFingerprint: entry.cardFingerprint || '',
+          payMinor: entry.payMinor, uniquePaidCard: true },
       }, finish);
     });
   }
 
   async function runCollect(ctx) {
+    if (ctx && ctx.collectionFinished) {
+      window.__m2CollectDone = true;
+      return;
+    }
+    if (document.hidden === true) {
+      window.__m2CollectorWasHidden = true;
+      const now = Date.now();
+      if (!window.__m2VisibilityRequestedAt || now - window.__m2VisibilityRequestedAt >= 1000) {
+        window.__m2VisibilityRequestedAt = now;
+        chrome.runtime.sendMessage({ type: 'm2_collectorNeedsVisibility', purchaseId: ctx.purchaseId });
+      }
+      return;
+    }
+    if (window.__m2CollectorWasHidden) {
+      window.__m2CollectorWasHidden = false;
+      try {
+        const key = 'm2_share_scan_' + ctx.purchaseId;
+        const scan = JSON.parse(sessionStorage.getItem(key) || 'null');
+        if (scan) { scan.lastAt = Date.now(); sessionStorage.setItem(key, JSON.stringify(scan)); }
+        const opened = savedOpenState();
+        if (opened && opened.purchaseId === ctx.purchaseId) { opened.lastAt = Date.now(); saveOpenState(opened); }
+      } catch (e) {}
+    }
     const listTarget = (ctx && ctx.listTarget) || '待分享';
     const kind = pageKind(location.href);
     if (kind === 'order_detail') {
@@ -358,16 +395,6 @@
       }
       return;
     }
-    if (listTarget === '待分享' && !shareListVisible(document)) {
-      let tries = 0;
-      try { tries = Number(sessionStorage.getItem('m2_share_tab_tries') || '0'); } catch (e) {}
-      if (tries < 3) {
-        try { sessionStorage.setItem('m2_share_tab_tries', String(tries + 1)); } catch (e) {}
-        return;
-      }
-    } else {
-      try { sessionStorage.removeItem('m2_share_tab_tries'); } catch (e) {}
-    }
     const entry = orderEntry(document, listTarget, ctx);
     const state = savedOpenState();
     const now = Date.now();
@@ -379,6 +406,7 @@
       }
     }
     if (entry) {
+      try { sessionStorage.removeItem('m2_share_scan_' + ctx.purchaseId); } catch (e) {}
       const progress = await reportEntry(ctx, entry);
       if (!progress.ok) {
         chrome.runtime.sendMessage({ type: 'm2_collectionPaused', purchaseId: ctx.purchaseId, reason: progress.reason });
@@ -389,6 +417,43 @@
       else press(entry.node);
       return;
     }
+    let shareScanCount = 0;
+    if (listTarget === '待分享') {
+      const key = 'm2_share_scan_' + ctx.purchaseId;
+      let scan;
+      try { scan = JSON.parse(sessionStorage.getItem(key) || 'null'); } catch (e) {}
+      if (!scan || !Number.isFinite(scan.startedAt) || !Number.isFinite(scan.lastAt)) {
+        scan = { startedAt: now, lastAt: now, reloads: 0 };
+        try { sessionStorage.setItem(key, JSON.stringify(scan)); } catch (e) {}
+      }
+      if (now - scan.lastAt < 10000) return;
+      if (scan.reloads < 3) {
+        scan.reloads++;
+        scan.lastAt = now;
+        try { sessionStorage.setItem(key, JSON.stringify(scan)); } catch (e) {}
+        await new Promise(function (resolve) {
+          let settled = false;
+          const timeout = setTimeout(function () { if (!settled) { settled = true; resolve(); } }, 1200);
+          chrome.runtime.sendMessage({ type: 'm2_collectionProgress', purchaseId: ctx.purchaseId,
+            stage: 'opening_list', reason: '正在第' + (scan.reloads + 1) + '次查看待分享订单' }, function () {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            resolve();
+          });
+        });
+        location.reload();
+        return;
+      }
+      shareScanCount = scan.reloads + 1;
+      try { sessionStorage.removeItem(key); } catch (e) {}
+      if (/加载中/.test(document.body ? document.body.innerText || '' : '')) {
+        window.__m2CollectDone = true;
+        chrome.runtime.sendMessage({ type: 'm2_collectionPaused', purchaseId: ctx.purchaseId,
+          reason: '待分享已刷新查看' + shareScanCount + '次，但订单列表仍在加载，请稍后重试补采' });
+        return;
+      }
+    }
     const cards = readCards(document);
     const progress = ctx.progress || {};
     const limited = (progress.screens || 0) >= 3 || (progress.details || 0) >= 5 || (progress.rounds || 0) >= 3;
@@ -396,8 +461,10 @@
       type: 'm2_orderCandidates',
       purchaseId: ctx.purchaseId,
       cards: cards,
+      hasVisiblePaidCard: !cards.length && hasVisiblePaidCard(document, listTarget, ctx.paymentMinor),
       reason: cards.length ? '订单列表有多张或无法可靠区分的卡片' : '订单列表未找到可读取的详情入口，可能还在加载',
       listTarget: listTarget,
+      shareScanCount: shareScanCount,
       searchComplete: !limited && !/加载中/.test(document.body ? document.body.innerText : ''),
       limitReached: limited,
     }, function (resp) {
@@ -415,8 +482,11 @@
         window.__m2CollectDone = true;
         return;
       }
+      if (resp && resp.status === 'unreadable') {
+        window.__m2CollectDone = true;
+        return;
+      }
       if (!resp || !resp.nextList) return;
-      try { sessionStorage.removeItem('m2_share_tab_tries'); } catch (e) {}
       press(findControl(resp.nextList));
     });
   }

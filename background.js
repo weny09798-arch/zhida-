@@ -130,7 +130,9 @@ async function readTabContext(tabId) {
 async function rememberTab(tabId, context) {
   const stored = await chrome.storage.local.get('tabContextMap');
   const map = stored.tabContextMap || {};
-  map[tabId] = context;
+  const previous = map[tabId];
+  map[tabId] = previous && previous.purchaseId === context.purchaseId && previous.collectionFinished
+    ? Object.assign({}, context, { collectionFinished: true }) : context;
   for (const tid of Object.keys(map)) {
     try {
       const existing = await chrome.tabs.get(parseInt(tid, 10));
@@ -140,6 +142,94 @@ async function rememberTab(tabId, context) {
     }
   }
   await chrome.storage.local.set({ tabContextMap: map });
+}
+
+let collectorFocusChain = Promise.resolve();
+function orderCollectionComplete(row) {
+  return !!(row && row.platformOrderSn && (row.logisticsSync === 'confirmed'
+    || (row.amount && row.amount.minor != null && Number.isFinite(Number(row.amount.minor)))));
+}
+function orderCollectionPaused(row) {
+  const stage = row && row.collection && row.collection.stage;
+  return !!(row && (row.status === 'awaiting_login'
+    || ['paused', 'awaiting_choice', 'needs_review', 'not_found'].includes(stage)));
+}
+function collectorTask(ctx, row, tasks) {
+  const id = ctx.taskId || (row && row.platformOrderSn ? 'order_detail:' : 'order_identity:') + ctx.purchaseId;
+  return (tasks || []).find(function (task) { return task.id === id; });
+}
+function collectorQueueStopped(ctx, row, tasks) {
+  if (!ctx.foregroundManaged) return false;
+  const task = collectorTask(ctx, row, tasks);
+  return !task || task.status === 'confirmed' || task.status === 'paused';
+}
+async function settleOrderCollection(row, purchaseId) {
+  for (const kind of ['order_identity', 'order_detail']) {
+    const id = kind + ':' + purchaseId;
+    if (!row || orderCollectionComplete(row) || (kind === 'order_identity' && row.platformOrderSn)) {
+      await syncQueue.confirm(id);
+    } else if (orderCollectionPaused(row)) {
+      await syncQueue.pause(id, row.collection && row.collection.reason || '这一轮查单已结束，等待重试');
+    }
+  }
+}
+function changeCollectorFocus(action) {
+  const next = collectorFocusChain.then(action, action);
+  collectorFocusChain = next.catch(function () {});
+  return next;
+}
+
+function finishCollector(tabId) {
+  return changeCollectorFocus(async function () {
+    const ctx = await readTabContext(tabId);
+    if (!ctx || !ctx.foregroundManaged || ctx.collectionFinished) return;
+    await rememberTab(tabId, Object.assign({}, ctx, { collectionFinished: true }));
+    if (ctx.parentCollectorTabId != null) {
+      const parent = await readTabContext(ctx.parentCollectorTabId);
+      if (parent && parent.purchaseId === ctx.purchaseId && parent.foregroundManaged) {
+        await rememberTab(ctx.parentCollectorTabId, Object.assign({}, parent, { collectionFinished: true }));
+      }
+    }
+    try {
+      const collector = await chrome.tabs.get(tabId);
+      // 用户已主动切到别的页面时，保留他的选择。
+      if (collector.active && ctx.returnTabId != null && ctx.returnTabId !== tabId) {
+        const previous = await chrome.tabs.get(ctx.returnTabId);
+        if (previous.windowId === collector.windowId) await chrome.tabs.update(previous.id, { active: true });
+      }
+    } catch (e) {}
+    const wake = setTimeout(function () { autoCollect(); }, 0);
+    if (wake && typeof wake.unref === 'function') wake.unref();
+  });
+}
+
+function activateCollector(tabId, purchaseId) {
+  return changeCollectorFocus(async function () {
+    const ctx = await readTabContext(tabId);
+    if (!ctx || ctx.purpose !== 'collect_orders' || !ctx.foregroundManaged
+      || ctx.collectionFinished || ctx.purchaseId !== purchaseId) {
+      return { ok: false, error: '当前页面没有正在执行的查单任务' };
+    }
+    const row = await purchaseStore.get(purchaseId);
+    const stored = await chrome.storage.local.get('m2SyncTasks');
+    const task = collectorTask(ctx, row, stored.m2SyncTasks);
+    if (!row || orderCollectionComplete(row) || orderCollectionPaused(row)
+      || !task || task.status !== 'leased' || !task.leaseUntil || task.leaseUntil <= Date.now()) {
+      await rememberTab(tabId, Object.assign({}, ctx, { collectionFinished: true }));
+      await settleOrderCollection(row, purchaseId);
+      return { ok: false, error: '这一轮查单已经结束，不再切换页面' };
+    }
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.active && Date.now() - (ctx.lastActivationAt || 0) >= 1000) {
+      const visible = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+      await rememberTab(tabId, Object.assign({}, ctx, {
+        returnTabId: visible[0] ? visible[0].id : ctx.returnTabId,
+        lastActivationAt: Date.now(), lastProgressAt: Date.now(),
+      }));
+      await chrome.tabs.update(tabId, { active: true });
+    }
+    return { ok: true };
+  });
 }
 
 // 从拼多多链接提取 goods_id
@@ -353,6 +443,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const stored = await chrome.storage.local.get('tabContextMap');
         const map = stored.tabContextMap || {};
         const ctx = tabId != null ? map[tabId] : null;
+        if (ctx && ctx.purpose === 'collect_orders' && !ctx.collectionFinished) {
+          const row = await purchaseStore.get(ctx.purchaseId);
+          const tasks = await chrome.storage.local.get('m2SyncTasks');
+          if (!row || orderCollectionComplete(row) || orderCollectionPaused(row)
+            || collectorQueueStopped(ctx, row, tasks.m2SyncTasks)) {
+            await settleOrderCollection(row, ctx.purchaseId);
+            await finishCollector(tabId);
+            ctx.collectionFinished = true;
+            await rememberTab(tabId, ctx);
+          }
+        }
         sendResponse({ ok: true, context: ctx || null });
       } catch (err) {
         sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
@@ -429,7 +530,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
         const tabCtx = await readTabContext(sender && sender.tab && sender.tab.id);
-        const purchaseId = tabCtx && tabCtx.purpose === 'collect_orders' ? tabCtx.purchaseId : '';
+        const purchaseId = tabCtx && tabCtx.purpose === 'collect_orders' && !tabCtx.collectionFinished ? tabCtx.purchaseId : '';
         if (!purchaseId || (msg.purchaseId && msg.purchaseId !== purchaseId)) {
           sendResponse({ ok: false, error: '采集页没有对上采购记录' });
           return;
@@ -455,12 +556,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const claim = await purchaseStore.claimCandidate(purchaseId, result.matches[0]);
           if (!claim.ok) {
             await purchaseStore.saveCandidates(purchaseId, result.matches, 'needs_review', '这张订单已经被另一笔采购记下');
+            await finishCollector(sender && sender.tab && sender.tab.id);
             sendResponse({ ok: false, error: '订单归属冲突' });
             return;
           }
           await syncQueue.confirm('order_identity:' + purchaseId);
           await syncQueue.schedule({ id: 'order_detail:' + purchaseId, purchaseId: purchaseId, kind: 'order_detail', nextAt: Date.now() });
+          await finishCollector(sender && sender.tab && sender.tab.id);
           sendResponse({ ok: true, purchaseId: purchaseId, status: 'unique' });
+          return;
+        }
+        if (result.status === 'none' && msg.hasVisiblePaidCard) {
+          const listTarget = msg.listTarget || (tabCtx && tabCtx.listTarget) || '待分享';
+          const reason = listTarget + '里能看到符合实付金额的订单，但插件无法安全确定并打开对应详情。请手动点开对应订单，或稍后重试补采';
+          await purchaseStore.saveCandidates(purchaseId, [], 'paused', reason, listTarget);
+          await syncQueue.pause('order_identity:' + purchaseId, reason);
+          await finishCollector(sender && sender.tab && sender.tab.id);
+          sendResponse({ ok: true, purchaseId: purchaseId, status: 'unreadable' });
           return;
         }
         if (result.status === 'choose') {
@@ -470,14 +582,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } else if (result.status === 'incomplete') {
           await purchaseStore.saveCandidates(purchaseId, result.matches, 'incomplete', '订单列表还没看完，不能把目前看到的一笔当成结果');
         } else if ((msg.listTarget || (tabCtx && tabCtx.listTarget) || '待分享') !== '待发货') {
-          await purchaseStore.saveCandidates(purchaseId, [], 'share_pending', '待分享里没有这单，再到待发货里找', '待发货');
+          const checked = Math.max(0, Math.min(10, Number(msg.shareScanCount) || 0));
+          if (checked < 4) {
+            await purchaseStore.saveCandidates(purchaseId, [], 'incomplete', '待分享还在重复查找，暂不切换到待发货', '待分享');
+            sendResponse({ ok: true, purchaseId: purchaseId, status: 'share_waiting' });
+            return;
+          }
+          await purchaseStore.saveCandidates(purchaseId, [], 'share_pending',
+            '待分享已查看' + checked + '次，暂未找到对应订单，接着查看待发货', '待发货');
           if (sender && sender.tab && sender.tab.id) {
             await rememberTab(sender.tab.id, Object.assign({}, tabCtx, { listTarget: '待发货', purpose: 'collect_orders' }));
           }
           sendResponse({ ok: true, purchaseId: purchaseId, status: 'share_pending', nextList: '待发货' });
           return;
         } else {
-          await purchaseStore.saveCandidates(purchaseId, [], 'not_found', '待分享和待发货里都没有对上的订单。可能还没更新、未付款，或已经发货');
+          await purchaseStore.saveCandidates(purchaseId, [], 'not_found', '这一轮在待分享和待发货里未找到对应订单，已暂停自动查单。请稍后点击重试补采');
+          await syncQueue.pause('order_identity:' + purchaseId, '这一轮查单未找到对应订单，请点击重试补采');
+          await syncQueue.pause('order_detail:' + purchaseId, '这一轮查单未找到对应订单，请点击重试补采');
+        }
+        if (result.status === 'choose' || result.status === 'account_changed' || result.status === 'account_unknown'
+          || (result.status === 'none' && tabCtx.listTarget === '待发货')) {
+          await finishCollector(sender && sender.tab && sender.tab.id);
         }
         sendResponse({ ok: true, purchaseId: purchaseId, status: result.status });
       } catch (err) {
@@ -487,12 +612,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg && msg.type === 'm2_collectorNeedsVisibility') {
+    (async () => {
+      try {
+        const tabId = sender && sender.tab && sender.tab.id;
+        sendResponse(await activateCollector(tabId, msg.purchaseId));
+      } catch (err) { sendResponse({ ok: false, error: String(err) }); }
+    })();
+    return true;
+  }
+
   if (msg && msg.type === 'm2_collectionProgress') {
     (async () => {
       try {
         const tabId = sender && sender.tab && sender.tab.id;
         const tabCtx = await readTabContext(tabId);
-        if (!tabCtx || tabCtx.purpose !== 'collect_orders' || tabCtx.purchaseId !== msg.purchaseId) {
+        if (!tabCtx || tabCtx.purpose !== 'collect_orders' || tabCtx.collectionFinished || tabCtx.purchaseId !== msg.purchaseId) {
           sendResponse({ ok: false, error: '采集页没有对上采购记录' });
           return;
         }
@@ -505,7 +640,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         const stage = msg.stage === 'entering_detail' ? 'entering_detail' : 'opening_list';
         const candidate = msg.candidate && msg.candidate.orderSn ? [{ orderSn: msg.candidate.orderSn, detailHref: msg.candidate.detailHref || '' }] : [];
-        await purchaseStore.saveCandidates(msg.purchaseId, candidate, stage, stage === 'entering_detail' ? '正在进入订单详情，核对归属' : '正在打开订单列表', tabCtx.listTarget);
+        await purchaseStore.saveCandidates(msg.purchaseId, candidate, stage,
+          stage === 'entering_detail' ? '正在进入订单详情，核对归属' : (msg.reason || '正在打开订单列表'), tabCtx.listTarget);
         await rememberTab(tabId, Object.assign({}, tabCtx, { lastStage: stage, lastProgressAt: Date.now(), candidate: msg.candidate || null }));
         sendResponse({ ok: true, purchaseId: msg.purchaseId });
       } catch (err) { sendResponse({ ok: false, error: String(err) }); }
@@ -518,11 +654,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const tabCtx = await readTabContext(sender && sender.tab && sender.tab.id);
         const purchaseId = tabCtx && tabCtx.purchaseId;
-        if (!purchaseId) {
+        const purchase = purchaseId ? await purchaseStore.get(purchaseId) : null;
+        if (!purchaseId || tabCtx.collectionFinished || orderCollectionComplete(purchase)) {
           sendResponse({ ok: false, error: '没有对应的采购' });
           return;
         }
-        await purchaseStore.saveCandidates(purchaseId, [], 'paused', msg.reason || '采集已暂停');
+        await purchaseStore.saveCandidates(purchaseId, [], 'paused', msg.reason || '采集已暂停', tabCtx.listTarget);
+        await syncQueue.pause('order_identity:' + purchaseId, msg.reason || '采集已暂停');
+        await syncQueue.pause('order_detail:' + purchaseId, msg.reason || '采集已暂停');
+        await finishCollector(sender && sender.tab && sender.tab.id);
         sendResponse({ ok: true, purchaseId: purchaseId });
       } catch (err) {
         sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
@@ -607,7 +747,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (tabCtx.candidate && tabCtx.candidate.cardFingerprint) {
               await purchaseStore.skipCard(purchaseId, tabCtx.candidate.cardFingerprint);
             }
-            await purchaseStore.saveCandidates(purchaseId, [], 'not_found', reason, tabCtx.listTarget);
+            await purchaseStore.saveCandidates(purchaseId, [], 'incomplete', reason, tabCtx.listTarget);
             const tabId = sender && sender.tab && sender.tab.id;
             const stored = await chrome.storage.local.get('tabContextMap');
             const map = stored.tabContextMap || {};
@@ -635,6 +775,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               await purchaseStore.saveCandidates(purchaseId, [candidate], 'needs_review', '订单详情与本次支付未能核实，请手动选择对应订单', tabCtx.listTarget);
               await syncQueue.pause('order_detail:' + purchaseId, '订单详情与支付记录不一致');
             }
+            await finishCollector(sender && sender.tab && sender.tab.id);
             sendResponse({ ok: false, error: '订单归属尚未核实，请在面板选择对应订单' });
             return;
           }
@@ -649,9 +790,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         const hasPaidAmount = msg.price != null && msg.price !== '' && Number.isFinite(Number(msg.price)) && Number(msg.price) >= 0;
+        const latestPurchase = hasPaidAmount ? purchase : await purchaseStore.get(purchaseId);
         if (hasPaidAmount) {
           await purchaseStore.setPaidAmount(purchaseId, { yuan: Number(msg.price), currency: 'CNY', source: 'paid' });
           await purchaseStore.reconcilePayment(purchaseId);
+          await syncQueue.confirm('order_detail:' + purchaseId);
+        } else if (latestPurchase && latestPurchase.amount && latestPurchase.paymentReceipt
+          && Number(latestPurchase.amount.minor) === Number(latestPurchase.paymentReceipt.amountMinor)) {
           await syncQueue.confirm('order_detail:' + purchaseId);
         } else {
           const due = Date.now() + 15000;
@@ -667,6 +812,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           kind: 'logistics',
           nextAt: Date.now() + LOGISTICS_INTERVAL_MS,
         });
+        if (hasPaidAmount || (latestPurchase && latestPurchase.amount)) await finishCollector(sender && sender.tab && sender.tab.id);
         sendResponse({ ok: true, purchaseId: purchaseId, message: '已记录订单号，等待发货后再回传物流' });
       } catch (err) {
         sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
@@ -694,6 +840,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await purchaseStore.setPaidAmount(purchaseId, { yuan: price, currency: 'CNY', source: 'paid' });
         await purchaseStore.reconcilePayment(purchaseId);
         await syncQueue.confirm('order_detail:' + purchaseId);
+        await finishCollector(sender && sender.tab && sender.tab.id);
         sendResponse({ ok: true, purchaseId: purchaseId });
       } catch (err) {
         sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
@@ -962,7 +1109,7 @@ async function takePaymentTab(tabId) {
 
 async function kickOrderLookup(purchaseId) {
   const purchase = await purchaseStore.get(purchaseId);
-  if (!purchase || purchase.platformOrderSn) return;
+  if (!purchase || purchase.platformOrderSn || orderCollectionPaused(purchase)) return;
   if (purchase.platform && purchase.platform !== 'PINDUODUO') return;
   const stored = await chrome.storage.local.get('tabContextMap');
   const map = stored.tabContextMap || {};
@@ -973,7 +1120,7 @@ async function kickOrderLookup(purchaseId) {
     if (!ctx || ctx.purchaseId !== purchaseId || ctx.purpose !== 'collect_orders') continue;
     try {
       const tab = await chrome.tabs.get(Number(id));
-      if (tab && Date.now() - (ctx.lastProgressAt || ctx.createdAt || 0) < 45000) {
+      if (tab && !ctx.collectionFinished && Date.now() - (ctx.lastProgressAt || ctx.createdAt || 0) < 45000) {
         already = true;
         continue;
       }
@@ -1001,7 +1148,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       delete map[String(tabId)];
       await chrome.storage.local.set({ tabContextMap: map });
       const row = await purchaseStore.get(ctx.purchaseId);
-      if (row && !row.platformOrderSn) {
+      if (row && !ctx.collectionFinished && !row.platformOrderSn && !orderCollectionPaused(row)) {
         const due = Date.now() + 15000;
         await syncQueue.retry('order_identity:' + ctx.purchaseId, due, '采集页已关闭');
         await scheduleLookupWake(due);
@@ -1029,20 +1176,59 @@ async function adoptOrderDetailTab(tab) {
   const orderSn = url.searchParams.get('order_sn');
   if (!orderSn) return;
   const parent = await readTabContext(tab.openerTabId);
-  if (!parent || parent.purpose !== 'collect_orders' || !parent.purchaseId) return;
+  if (!parent || parent.purpose !== 'collect_orders' || parent.collectionFinished || !parent.purchaseId) return;
   if (parent.candidate && parent.candidate.orderSn && parent.candidate.orderSn !== orderSn) return;
   const row = await purchaseStore.get(parent.purchaseId);
   if (!row || (row.platformOrderSn && row.platformOrderSn !== orderSn)) return;
   await rememberTab(tab.id, Object.assign({}, parent, {
-    candidate: { orderSn: orderSn, detailHref: tab.url,
-      cardFingerprint: parent.candidate && parent.candidate.cardFingerprint || '' },
+    candidate: Object.assign({}, parent.candidate, { orderSn: orderSn, detailHref: tab.url,
+      cardFingerprint: parent.candidate && parent.candidate.cardFingerprint || '' }),
+    parentCollectorTabId: tab.openerTabId,
     createdByExtension: false,
     lastStage: 'entering_detail', lastProgressAt: Date.now(),
   }));
+  await captureClickedOrderNavigation(tab.id, tab.url);
+}
+async function captureClickedOrderNavigation(tabId, href) {
+  let url;
+  try { url = new URL(href); } catch (e) { return; }
+  if (url.origin !== 'https://mobile.yangkeduo.com' || url.pathname !== '/order.html') return;
+  const orderSn = url.searchParams.get('order_sn') || '';
+  if (!/^\d{6}-\d{15}$/.test(orderSn)) return;
+  const ctx = await readTabContext(tabId);
+  if (!ctx || ctx.purpose !== 'collect_orders' || ctx.listTarget !== '待分享'
+    || ctx.lastStage !== 'entering_detail' || !ctx.candidate
+    || !ctx.candidate.uniquePaidCard || !ctx.candidate.cardFingerprint
+    || !ctx.lastProgressAt || Date.now() - ctx.lastProgressAt > 30000) return;
+  if (ctx.candidate.orderSn && ctx.candidate.orderSn !== orderSn) return;
+  const row = await purchaseStore.get(ctx.purchaseId);
+  const receipt = row && row.paymentReceipt;
+  if (!row || row.platformOrderSn || !receipt || receipt.status !== 'succeeded'
+    || receipt.amountMinor == null || ctx.candidate.payMinor == null
+    || Number(ctx.candidate.payMinor) !== Number(receipt.amountMinor)) return;
+  const dates = [receipt.observedAt, row.purchaseIntent && row.purchaseIntent.submittedAt].filter(Boolean)
+    .map(function (at) { return new Date(Number(at) + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, ''); });
+  if (!dates.includes(orderSn.slice(0, 6))) return;
+  const owners = await purchaseStore.findByPlatformOrder('PINDUODUO', orderSn);
+  if (owners.some(function (owner) { return owner.purchaseId !== ctx.purchaseId; })) return;
+  const claim = await purchaseStore.claimCandidate(ctx.purchaseId, { orderSn: orderSn, detailHref: url.href });
+  if (!claim.ok) return;
+  await purchaseStore.setPaidAmount(ctx.purchaseId, { yuan: Number(receipt.amountMinor) / 100, currency: 'CNY', source: 'paid' });
+  await purchaseStore.reconcilePayment(ctx.purchaseId);
+  await syncQueue.confirm('order_identity:' + ctx.purchaseId);
+  await syncQueue.confirm('order_detail:' + ctx.purchaseId);
+  await syncQueue.schedule({ id: 'logistics:' + ctx.purchaseId, purchaseId: ctx.purchaseId,
+    kind: 'logistics', nextAt: Date.now() + LOGISTICS_INTERVAL_MS });
+  await rememberTab(tabId, Object.assign({}, ctx, { candidate: Object.assign({}, ctx.candidate,
+    { orderSn: orderSn, detailHref: url.href }), lastStage: 'order_linked', lastProgressAt: Date.now() }));
+  await finishCollector(tabId);
 }
 chrome.tabs.onCreated.addListener(function (tab) { adoptOrderDetailTab(tab).catch(function () {}); });
 chrome.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
-  if (changeInfo && changeInfo.url) adoptOrderDetailTab(Object.assign({}, tab, { id: tabId, url: changeInfo.url })).catch(function () {});
+  if (changeInfo && changeInfo.url) {
+    adoptOrderDetailTab(Object.assign({}, tab, { id: tabId, url: changeInfo.url })).catch(function () {});
+    captureClickedOrderNavigation(tabId, changeInfo.url).catch(function () {});
+  }
 });
 
 // ---------- 定时自动采集运输单号 ----------
@@ -1054,15 +1240,23 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 let autoCollecting = false;
 let autoCollectRequested = false;
 async function reconcileCollectorTabs(now) {
-  const stored = await chrome.storage.local.get('tabContextMap');
+  const stored = await chrome.storage.local.get(['tabContextMap', 'm2SyncTasks']);
   const map = stored.tabContextMap || {};
   const activeTasks = [];
   const staleTabs = [];
-  let changed = false;
+  const deletedIds = [];
   for (const id of Object.keys(map)) {
     const ctx = map[id];
     if (!ctx || ctx.purpose !== 'collect_orders' || !ctx.purchaseId) continue;
+    if (ctx.collectionFinished) continue;
     const row = await purchaseStore.get(ctx.purchaseId);
+    if (!row || orderCollectionComplete(row) || orderCollectionPaused(row)
+      || collectorQueueStopped(ctx, row, stored.m2SyncTasks)) {
+      await settleOrderCollection(row, ctx.purchaseId);
+      await finishCollector(Number(id));
+      await rememberTab(Number(id), Object.assign({}, ctx, { collectionFinished: true }));
+      continue;
+    }
     let tab = null;
     try { tab = await chrome.tabs.get(Number(id)); } catch (e) {}
     if (row && tab && now - (ctx.lastProgressAt || ctx.createdAt || 0) < 45000) {
@@ -1070,8 +1264,7 @@ async function reconcileCollectorTabs(now) {
       activeTasks.push(kind + ':' + ctx.purchaseId);
       continue;
     }
-    delete map[id];
-    changed = true;
+    deletedIds.push(id);
     if (tab && ctx.createdByExtension && chrome.tabs.remove) staleTabs.push(Number(id));
     if (row && !row.platformOrderSn) {
       const stage = row.collection && row.collection.stage;
@@ -1082,7 +1275,12 @@ async function reconcileCollectorTabs(now) {
       }
     }
   }
-  if (changed) await chrome.storage.local.set({ tabContextMap: map });
+  if (deletedIds.length) {
+    const latest = await chrome.storage.local.get('tabContextMap');
+    const updated = latest.tabContextMap || {};
+    for (const id of deletedIds) delete updated[id];
+    await chrome.storage.local.set({ tabContextMap: updated });
+  }
   for (const id of staleTabs) {
     try { await chrome.tabs.remove(id); } catch (e) {}
   }
@@ -1103,7 +1301,6 @@ async function autoCollect() {
     const rows = await purchaseStore.list();
     for (const row of rows) {
       if (row.platform && row.platform !== 'PINDUODUO') continue;
-      if (row.status === 'awaiting_login') continue;
       const stage = row.collection && row.collection.stage;
       if (stage === 'awaiting_choice' && row.collection.reason === '订单详情已打开，请核对后点选对应订单'
           && !row.platformOrderSn && row.paymentReceipt
@@ -1124,7 +1321,8 @@ async function autoCollect() {
         }
         continue;
       }
-      if (stage === 'awaiting_choice' || stage === 'needs_review' || stage === 'paused') continue;
+      await settleOrderCollection(row, row.purchaseId);
+      if (orderCollectionPaused(row)) continue;
       if (!row.platformOrderSn && (row.paymentReceipt || stage === 'submitted' || stage === 'awaiting_order_detail' || stage === 'incomplete' || stage === 'not_found' || stage === 'share_pending')) {
         await syncQueue.schedule({ id: 'order_identity:' + row.purchaseId, purchaseId: row.purchaseId, kind: 'order_identity', nextAt: now });
         continue;
@@ -1132,12 +1330,31 @@ async function autoCollect() {
       if (row.platformOrderSn && row.logisticsSync !== 'confirmed' && row.status !== 'needs_review') {
         await syncQueue.schedule({ id: 'logistics:' + row.purchaseId, purchaseId: row.purchaseId, kind: 'logistics', nextAt: now + LOGISTICS_INTERVAL_MS });
       }
-      if (row.platformOrderSn && (!row.amount || (row.collection && row.collection.stage === 'order_linked'))) {
+      if (row.platformOrderSn && !orderCollectionComplete(row)) {
         await syncQueue.schedule({ id: 'order_detail:' + row.purchaseId, purchaseId: row.purchaseId, kind: 'order_detail', nextAt: now });
       }
     }
     if (activeTasks.length) await syncQueue.claim(activeTasks, now, 2 * 60 * 1000);
-    const picked = await syncQueue.pick(now, 2);
+    const dueTasks = await syncQueue.pick(now, 100);
+    const picked = [];
+    let orderCollectorBusy = activeTasks.length > 0;
+    for (const task of dueTasks) {
+      if (task.kind !== 'logistics') {
+        const row = await purchaseStore.get(task.purchaseId);
+        if (!row || orderCollectionComplete(row) || (task.kind === 'order_identity' && row.platformOrderSn)) {
+          await syncQueue.confirm(task.id);
+          continue;
+        }
+        if (orderCollectionPaused(row)) {
+          await syncQueue.pause(task.id, row.collection && row.collection.reason || '等待重试');
+          continue;
+        }
+      }
+      if (task.kind !== 'logistics' && orderCollectorBusy) continue;
+      picked.push(task);
+      if (task.kind !== 'logistics') orderCollectorBusy = true;
+      if (picked.length >= 2) break;
+    }
     if (picked.length) await syncQueue.claim(picked.map((task) => task.id), now, 2 * 60 * 1000);
     for (const task of picked) {
       const row = await purchaseStore.get(task.purchaseId);
@@ -1173,13 +1390,19 @@ async function autoCollect() {
         await syncQueue.retry(task.id, now + 15000, '缺少查询地址');
         continue;
       }
-      const tab = await chrome.tabs.create({ url: url, active: false });
+      const foreground = purpose === 'collect_orders';
+      const previousTabs = foreground ? await chrome.tabs.query({ active: true, lastFocusedWindow: true }) : [];
+      const previousTab = previousTabs[0];
+      const createOptions = { url: foreground ? 'about:blank' : url, active: false };
+      if (previousTab && previousTab.windowId != null) createOptions.windowId = previousTab.windowId;
+      const tab = await chrome.tabs.create(createOptions);
       if (tab && tab.id) {
         const claimedOrderSns = rows.filter(function (item) {
           return item.platform === 'PINDUODUO' && item.platformOrderSn;
         }).map(function (item) { return item.platformOrderSn; });
         await rememberTab(tab.id, {
           purchaseId: row.purchaseId,
+          taskId: task.id,
           purpose: purpose,
           shopeeOrder: {
             orderSn: row.orderSn,
@@ -1199,11 +1422,14 @@ async function autoCollect() {
           claimedOrderSns: claimedOrderSns,
           skippedCardFingerprints: row.skippedCardFingerprints || [],
           createdByExtension: true,
+          foregroundManaged: foreground,
+          returnTabId: previousTab ? previousTab.id : null,
           createdAt: now,
           lastStage: task.kind === 'order_identity' ? 'opening_list' : 'entering_detail',
           lastProgressAt: now,
           progress: { screens: 0, details: task.kind === 'order_detail' ? 1 : 0, rounds: (row.collection && row.collection.rounds) || 0 },
         });
+        if (foreground) await chrome.tabs.update(tab.id, { url: url, active: true });
       }
     }
     if (picked.length) {

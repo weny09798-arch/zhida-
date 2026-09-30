@@ -7,11 +7,12 @@ const vm = require('node:vm');
 const dir = path.join(__dirname, '..');
 function harness(seed = {}) {
   const state = structuredClone(seed);
-  const tabs = new Map([[9, { id: 9, url: 'https://mobile.yangkeduo.com/goods.html' }]]);
+  const tabs = new Map([[9, { id: 9, windowId: 1, active: true, url: 'https://mobile.yangkeduo.com/goods.html' }]]);
   const created = [];
   const removedWithContext = [];
   const handlers = {};
   const alarms = [];
+  const tabUpdates = [];
   const chrome = {
     runtime: { getManifest: () => ({ version: 'test' }), onMessage: { addListener: fn => { handlers.message = fn; } } },
     storage: { local: {
@@ -20,7 +21,20 @@ function harness(seed = {}) {
     } },
     tabs: {
       async get(id) { if (!tabs.has(id)) throw Error('No tab'); return tabs.get(id); },
-      async create(input) { const tab = { id: 100 + created.length, ...input }; created.push(tab); tabs.set(tab.id, tab); return tab; },
+      async query(input) { return Array.from(tabs.values()).filter(tab => (!input.active || tab.active) && (input.windowId == null || tab.windowId === input.windowId)); },
+      async update(id, input) {
+        if (!tabs.has(id)) throw Error('No tab');
+        const tab = tabs.get(id);
+        if (input.active) for (const item of tabs.values()) if (item.windowId === tab.windowId) item.active = false;
+        Object.assign(tab, input);
+        tabUpdates.push({ id, ...input, hasContext: !!(state.tabContextMap && state.tabContextMap[id]) });
+        return tab;
+      },
+      async create(input) {
+        const tab = { id: 100 + created.length, windowId: 1, ...input };
+        if (tab.active) for (const item of tabs.values()) if (item.windowId === tab.windowId) item.active = false;
+        created.push(tab); tabs.set(tab.id, tab); return tab;
+      },
       async remove(id) { removedWithContext.push(!!(state.tabContextMap && state.tabContextMap[id])); tabs.delete(id); },
       onRemoved: { addListener: fn => { handlers.removed = fn; } },
       onCreated: { addListener: fn => { handlers.created = fn; } },
@@ -34,7 +48,7 @@ function harness(seed = {}) {
   async function message(msg, tab = { id: 9 }) {
     return new Promise(resolve => { handlers.message(msg, { tab }, resolve); });
   }
-  return { state, tabs, created, removedWithContext, handlers, alarms, message };
+  return { state, tabs, created, removedWithContext, handlers, alarms, message, tabUpdates };
 }
 
 function seedPurchase(overrides = {}) {
@@ -52,6 +66,210 @@ function seed(row = seedPurchase(), extra = {}) {
     m2SyncTasks: [], ...extra,
   };
 }
+
+test('order lookup saves its context before showing the query page automatically', async () => {
+  const app = harness(seed());
+  await app.message({ type: 'm2_paymentResult', result: { status: 'succeeded', amountMinor: 60 } });
+  const collector = app.created[0];
+  assert.equal(collector.active, true);
+  assert.equal(app.state.tabContextMap[collector.id].returnTabId, 9);
+  assert.equal(app.state.tabContextMap[collector.id].foregroundManaged, true);
+  assert.equal(app.tabUpdates.find(update => update.url && /orders\.html/.test(update.url)).hasContext, true);
+});
+
+test('a paused foreground lookup returns to the page that was open before lookup', async () => {
+  const app = harness(seed());
+  await app.message({ type: 'm2_paymentResult', result: { status: 'succeeded', amountMinor: 60 } });
+  const collector = app.created[0];
+  await app.message({ type: 'm2_collectionPaused', purchaseId: 'P-1', reason: '列表加载失败' }, { id: collector.id });
+  assert.equal(app.tabs.get(9).active, true);
+  assert.equal(app.state.tabContextMap[collector.id].collectionFinished, true);
+});
+
+test('finishing lookup preserves the user choice if they switched to another tab', async () => {
+  const app = harness(seed());
+  await app.message({ type: 'm2_paymentResult', result: { status: 'succeeded', amountMinor: 60 } });
+  const collector = app.created[0];
+  collector.active = false;
+  app.tabs.set(88, { id: 88, windowId: 1, active: true, url: 'https://example.com/' });
+  await app.message({ type: 'm2_collectionPaused', purchaseId: 'P-1', reason: '列表加载失败' }, { id: collector.id });
+  assert.equal(app.tabs.get(88).active, true);
+  assert.equal(app.tabs.get(9).active, false);
+});
+
+test('two pending order lookups do not hide each other by opening two foreground tabs', async () => {
+  const rows = [seedPurchase({ purchaseId: 'P-1', paymentReceipt: { status: 'succeeded', amountMinor: 60 } }),
+    seedPurchase({ purchaseId: 'P-2', paymentReceipt: { status: 'succeeded', amountMinor: 70 } })];
+  const app = harness(seed(rows[0], { m2Purchases: rows }));
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.created.length, 1);
+  const first = app.created[0];
+  await app.message({ type: 'm2_collectionPaused', purchaseId: 'P-1', reason: '结束这一轮' }, { id: first.id });
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.created.length, 2);
+  assert.equal(app.state.tabContextMap[app.created[1].id].purchaseId, 'P-2');
+});
+
+test('a collector hidden before loading requests activation and remembers the latest return page', async () => {
+  const app = harness(seed());
+  await app.message({ type: 'm2_paymentResult', result: { status: 'succeeded', amountMinor: 60 } });
+  const collector = app.created[0];
+  collector.active = false;
+  app.tabs.set(88, { id: 88, windowId: 1, active: true, url: 'https://example.com/' });
+  const reply = await Promise.race([app.message({ type: 'm2_collectorNeedsVisibility', purchaseId: 'P-1' }, { id: collector.id }),
+    new Promise(resolve => setTimeout(() => resolve({ ok: false }), 100))]);
+  assert.equal(reply.ok, true);
+  assert.equal(collector.active, true);
+  assert.equal(app.state.tabContextMap[collector.id].returnTabId, 88);
+  await app.message({ type: 'm2_collectionPaused', purchaseId: 'P-1', reason: '结束' }, { id: collector.id });
+  assert.equal(app.tabs.get(88).active, true);
+});
+
+test('a successful automatic lookup saves the order and returns to the original tab', async () => {
+  const app = harness(seed());
+  await app.message({ type: 'm2_paymentResult', result: { status: 'succeeded', amountMinor: 60 } });
+  const collector = app.created[0];
+  await app.message({ type: 'm2_collectionProgress', purchaseId: 'P-1', stage: 'entering_detail',
+    candidate: { cardFingerprint: 'paid-60', payMinor: 60, uniquePaidCard: true } }, { id: collector.id });
+  const orderSn = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') + '-070296605030351';
+  const detailHref = 'https://mobile.yangkeduo.com/order.html?order_sn=' + orderSn;
+  app.handlers.updated(collector.id, { url: detailHref }, { id: collector.id, url: detailHref });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(app.state.m2Purchases[0].platformOrderSn, orderSn);
+  assert.equal(app.state.m2Purchases[0].amount.minor, 60);
+  assert.equal(app.tabs.get(9).active, true);
+  assert.equal(app.state.tabContextMap[collector.id].collectionFinished, true);
+  const stale = await app.message({ type: 'm2_collectionProgress', purchaseId: 'P-1', stage: 'opening_list' }, { id: collector.id });
+  assert.equal(stale.ok, false);
+  assert.equal(app.state.m2Purchases[0].collection.stage, 'amount_confirmed');
+});
+
+test('a delayed visibility request cannot reactivate a collector that just finished', async () => {
+  const app = harness(seed());
+  await app.message({ type: 'm2_paymentResult', result: { status: 'succeeded', amountMinor: 60 } });
+  const collector = app.created[0];
+  collector.active = false;
+  app.tabs.set(88, { id: 88, windowId: 1, active: true, url: 'https://example.com/' });
+  await Promise.all([
+    app.message({ type: 'm2_collectionPaused', purchaseId: 'P-1', reason: '结束' }, { id: collector.id }),
+    app.message({ type: 'm2_collectorNeedsVisibility', purchaseId: 'P-1' }, { id: collector.id }),
+  ]);
+  assert.equal(app.state.tabContextMap[collector.id].collectionFinished, true);
+  assert.equal(collector.active, false);
+  assert.equal(app.tabs.get(88).active, true);
+});
+
+test('a detail opened in a new tab completes both collector contexts and returns focus', async () => {
+  const app = harness(seed());
+  await app.message({ type: 'm2_paymentResult', result: { status: 'succeeded', amountMinor: 60 } });
+  const parent = app.created[0];
+  await app.message({ type: 'm2_collectionProgress', purchaseId: 'P-1', stage: 'entering_detail',
+    candidate: { cardFingerprint: 'paid-60', payMinor: 60, uniquePaidCard: true } }, { id: parent.id });
+  const sn = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') + '-070296605030351';
+  const child = { id: 20, windowId: 1, active: true, openerTabId: parent.id,
+    url: 'https://mobile.yangkeduo.com/order.html?order_sn=' + sn };
+  parent.active = false;
+  app.tabs.set(20, child);
+  app.handlers.created(child);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(app.state.m2Purchases[0].platformOrderSn, sn);
+  assert.equal(app.state.tabContextMap[parent.id].collectionFinished, true);
+  assert.equal(app.state.tabContextMap[20].collectionFinished, true);
+  assert.equal(app.tabs.get(9).active, true);
+});
+
+for (const sample of [
+  { name: 'already recorded', row: seedPurchase({ platformOrderSn: 'PDD-123', amount: { minor: 60 }, collection: { stage: 'order_linked' } }) },
+  { name: 'paused', row: seedPurchase({ collection: { stage: 'paused' } }) },
+  { name: 'not found in the completed search', row: seedPurchase({ collection: { stage: 'not_found' } }) },
+  { name: 'deleted', row: null },
+  { name: 'queue task already confirmed', row: seedPurchase(), taskStatus: 'confirmed' },
+]) {
+  test('a stale collector cannot steal focus when its purchase is ' + sample.name, async () => {
+    const app = harness(seed(sample.row, {
+      m2Purchases: sample.row ? [sample.row] : [],
+      tabContextMap: { 77: { purchaseId: 'P-1', purpose: 'collect_orders', foregroundManaged: true,
+        taskId: 'order_identity:P-1', returnTabId: 9, lastProgressAt: Date.now() } },
+      m2SyncTasks: [{ id: 'order_identity:P-1', purchaseId: 'P-1', kind: 'order_identity',
+        status: sample.taskStatus || 'leased', leaseUntil: Date.now() + 120000, nextAt: 0 }],
+    }));
+    app.tabs.set(77, { id: 77, windowId: 1, active: false, url: 'https://mobile.yangkeduo.com/orders.html' });
+    const reply = await app.message({ type: 'm2_collectorNeedsVisibility', purchaseId: 'P-1' }, { id: 77 });
+    assert.equal(reply.ok, false);
+    assert.equal(app.tabs.get(9).active, true);
+    assert.equal(app.tabs.get(77).active, false);
+    assert.equal(app.state.tabContextMap[77].collectionFinished, true);
+  });
+}
+
+test('obsolete detail tasks do not reopen a recorded order or block a new purchase', async () => {
+  const done = seedPurchase({ platformOrderSn: 'PDD-123', amount: { minor: 0 }, collection: { stage: 'order_linked' } });
+  const fresh = seedPurchase({ purchaseId: 'P-2' });
+  const app = harness(seed(done, { m2Purchases: [done, fresh],
+    tabContextMap: { 77: { purchaseId: 'P-1', purpose: 'collect_orders', foregroundManaged: true,
+      returnTabId: 9, lastProgressAt: Date.now() } },
+    m2SyncTasks: [
+      { id: 'order_detail:P-1', purchaseId: 'P-1', kind: 'order_detail', status: 'pending', nextAt: 0 },
+      { id: 'order_identity:P-2', purchaseId: 'P-2', kind: 'order_identity', status: 'pending', nextAt: 0 },
+    ],
+  }));
+  app.tabs.set(77, { id: 77, windowId: 1, active: false, url: 'https://mobile.yangkeduo.com/orders.html' });
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.created.length, 1);
+  assert.equal(app.state.tabContextMap[app.created[0].id].purchaseId, 'P-2');
+  assert.equal(app.state.m2SyncTasks.find(task => task.id === 'order_detail:P-1').status, 'confirmed');
+  assert.equal(app.state.tabContextMap[77].collectionFinished, true);
+});
+
+for (const checkContext of [true, false]) test('a confirmed queue task frees the next purchase through ' + (checkContext ? 'page context' : 'periodic recovery'), async () => {
+  const app = harness(seed(seedPurchase(), {
+    m2Purchases: [seedPurchase(), seedPurchase({ purchaseId: 'P-2' })],
+    tabContextMap: { 77: { purchaseId: 'P-1', purpose: 'collect_orders', foregroundManaged: true,
+      taskId: 'order_identity:P-1', lastProgressAt: Date.now(), returnTabId: 9 } },
+    m2SyncTasks: [
+      { id: 'order_identity:P-1', purchaseId: 'P-1', kind: 'order_identity', status: 'confirmed', nextAt: 0 },
+      { id: 'order_identity:P-2', purchaseId: 'P-2', kind: 'order_identity', status: 'pending', nextAt: 0 },
+    ],
+  }));
+  app.tabs.set(77, { id: 77, windowId: 1, active: false, url: 'https://mobile.yangkeduo.com/orders.html' });
+  if (checkContext) {
+    const ctx = await app.message({ type: 'm2_getTabContext' }, { id: 77 });
+    assert.equal(ctx.context.collectionFinished, true);
+  }
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.created.length, 1);
+  assert.equal(app.state.tabContextMap[app.created[0].id].purchaseId, 'P-2');
+  assert.equal(app.state.tabContextMap[77].collectionFinished, true);
+});
+
+test('an unsuccessful completed lookup stays paused across timer runs until an explicit retry', async () => {
+  const app = harness(seed());
+  await app.message({ type: 'm2_paymentResult', result: { status: 'succeeded', amountMinor: 60 } });
+  const collector = app.created[0];
+  app.state.tabContextMap[collector.id].listTarget = '待发货';
+  await app.message({ type: 'm2_orderCandidates', purchaseId: 'P-1', listTarget: '待发货', searchComplete: true, cards: [] }, { id: collector.id });
+  assert.equal(app.state.m2SyncTasks.find(task => task.kind === 'order_identity').status, 'paused');
+  // Simulate the periodic alarm after the old lease has expired.
+  for (const task of app.state.m2SyncTasks) { task.nextAt = 0; task.leaseUntil = 0; }
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.created.length, 1);
+  assert.equal(app.tabs.get(9).active, true);
+  await app.message({ type: 'm2_retryCollection', purchaseId: 'P-1' });
+  assert.equal(app.created.length, 2);
+  assert.match(app.created[1].url, /orders\.html\?type=5/);
+});
+
+test('closing a finished paused collector does not revive its queue task', async () => {
+  const app = harness(seed(seedPurchase({ collection: { stage: 'paused' } }), {
+    tabContextMap: { 77: { purchaseId: 'P-1', purpose: 'collect_orders', collectionFinished: true } },
+    m2SyncTasks: [{ id: 'order_identity:P-1', purchaseId: 'P-1', kind: 'order_identity', status: 'paused', nextAt: 0 }],
+  }));
+  app.handlers.removed(77);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(app.state.m2SyncTasks[0].status, 'paused');
+  assert.equal(app.alarms.some(alarm => alarm.name === 'lookupRetry'), false);
+});
 
 test('payment success starts lookup despite a stale collection mapping', async () => {
   const app = harness(seed(seedPurchase(), { tabContextMap: { 9: { purchaseId: 'P-1' }, 77: { purchaseId: 'P-1', purpose: 'collect_orders' } } }));
@@ -116,6 +334,44 @@ test('a paid order detail reached by this lookup is recorded without another cli
   assert.equal(app.state.m2Purchases[0].amount.minor, 199);
   const logistics = app.state.m2SyncTasks.find(task => task.id === 'logistics:P-1');
   assert.ok(logistics.nextAt >= now + 2 * 60 * 60 * 1000);
+});
+
+test('a unique paid share card can confirm its order number from the clicked navigation even if detail fails', async () => {
+  const now = Date.now();
+  const orderSn = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') + '-070296605030351';
+  const detailHref = 'https://mobile.yangkeduo.com/order.html?order_sn=' + orderSn;
+  const purchase = seedPurchase({ paymentReceipt: { status: 'succeeded', amountMinor: 60, observedAt: now }, purchaseIntent: { submittedAt: now } });
+  const app = harness(seed(purchase, { tabContextMap: { 9: { purchaseId: 'P-1', purpose: 'collect_orders', listTarget: '待分享', platform: 'PINDUODUO' } } }));
+  const progress = await app.message({ type: 'm2_collectionProgress', purchaseId: 'P-1', stage: 'entering_detail', candidate: {
+    orderSn: '', detailHref: '', cardFingerprint: 'card-60', payMinor: 60, uniquePaidCard: true,
+  } });
+  assert.equal(progress.ok, true);
+  app.handlers.updated(9, { url: detailHref }, { id: 9, url: detailHref });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(app.state.m2Purchases[0].platformOrderSn, orderSn);
+  assert.equal(app.state.m2Purchases[0].amount.minor, 60);
+  assert.equal(app.state.m2SyncTasks.some(task => task.id === 'order_identity:P-1' && task.status !== 'confirmed'), false);
+  assert.ok(app.state.m2SyncTasks.some(task => task.id === 'logistics:P-1'));
+});
+
+test('same-tab URL alone never attaches an order without exact paid-card evidence', async () => {
+  const now = Date.now();
+  const orderSn = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') + '-070296605030351';
+  const detailHref = 'https://mobile.yangkeduo.com/order.html?order_sn=' + orderSn;
+  const purchase = seedPurchase({ paymentReceipt: { status: 'succeeded', amountMinor: 60, observedAt: now }, purchaseIntent: { submittedAt: now } });
+  for (const candidate of [
+    { cardFingerprint: 'card', payMinor: 70, uniquePaidCard: true },
+    { cardFingerprint: 'card', payMinor: 60, uniquePaidCard: false },
+    { cardFingerprint: '', payMinor: 60, uniquePaidCard: true },
+  ]) {
+    const app = harness(seed(purchase, { tabContextMap: { 9: {
+      purchaseId: 'P-1', purpose: 'collect_orders', listTarget: '待分享', platform: 'PINDUODUO',
+      lastStage: 'entering_detail', lastProgressAt: now, candidate,
+    } } }));
+    app.handlers.updated(9, { url: detailHref }, { id: 9, url: detailHref });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(app.state.m2Purchases[0].platformOrderSn, null);
+  }
 });
 
 test('same-day detail with a different paid amount stays unlinked', async () => {
@@ -203,6 +459,51 @@ test('a list candidate with matching paid amount is opened for detail verificati
   assert.equal(reply.status, 'inspect');
   assert.equal(app.state.m2Purchases[0].platformOrderSn, null);
   assert.equal(app.state.tabContextMap[9].candidate.orderSn, orderSn);
+});
+
+test('a visible but unreadable paid share card does not become a false not-found result', async () => {
+  const purchase = seedPurchase({ paymentReceipt: { status: 'succeeded', amountMinor: 70 }, purchaseIntent: { goodsId: '123', submittedAt: Date.now() } });
+  const app = harness(seed(purchase, { tabContextMap: { 9: { purchaseId: 'P-1', purpose: 'collect_orders', listTarget: '待分享' } } }));
+  const reply = await app.message({ type: 'm2_orderCandidates', purchaseId: 'P-1', listTarget: '待分享', searchComplete: true, cards: [], hasVisiblePaidCard: true });
+  assert.equal(reply.status, 'unreadable');
+  assert.equal(reply.nextList, undefined);
+  assert.equal(app.state.m2Purchases[0].collection.listTarget, '待分享');
+  assert.match(app.state.m2Purchases[0].collection.reason, /能看到|有订单/);
+  const retried = await app.message({ type: 'm2_retryCollection', purchaseId: 'P-1' });
+  assert.equal(retried.ok, true);
+  assert.equal(app.state.m2Purchases[0].collection.listTarget, '待分享');
+  assert.match(app.created.at(-1).url, /orders\.html\?type=5/);
+});
+
+test('an unreadable paid share card does not get hidden by unrelated order links', async () => {
+  const now = Date.now();
+  const oldSn = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(2, 10).replace(/-/g, '') + '-111111111111111';
+  const oldHref = 'https://mobile.yangkeduo.com/order.html?order_sn=' + oldSn;
+  const purchase = seedPurchase({ paymentReceipt: { status: 'succeeded', amountMinor: 60, observedAt: now }, purchaseIntent: { submittedAt: now } });
+  const app = harness(seed(purchase, { tabContextMap: { 9: { purchaseId: 'P-1', purpose: 'collect_orders', listTarget: '待分享' } } }));
+  const reply = await app.message({ type: 'm2_orderCandidates', purchaseId: 'P-1', listTarget: '待分享', searchComplete: true,
+    cards: [{ orderSn: oldSn, accountId: '', payMinor: 70, status: '待分享', detailHref: oldHref }], hasVisiblePaidCard: true });
+  assert.equal(reply.status, 'unreadable');
+  assert.equal(app.state.m2Purchases[0].collection.listTarget, '待分享');
+  assert.match(app.state.m2Purchases[0].collection.reason, /能看到/);
+});
+
+test('share lookup changes lists only after a completed repeated scan', async () => {
+  const now = Date.now();
+  const purchase = seedPurchase({ paymentReceipt: { status: 'succeeded', amountMinor: 60, observedAt: now }, purchaseIntent: { submittedAt: now } });
+  const app = harness(seed(purchase, { tabContextMap: { 9: { purchaseId: 'P-1', purpose: 'collect_orders', listTarget: '待分享' } } }));
+  const early = await app.message({ type: 'm2_orderCandidates', purchaseId: 'P-1', listTarget: '待分享', searchComplete: false,
+    shareScanCount: 1, cards: [] });
+  assert.equal(early.nextList, undefined);
+  assert.equal(app.state.tabContextMap[9].listTarget, '待分享');
+  const premature = await app.message({ type: 'm2_orderCandidates', purchaseId: 'P-1', listTarget: '待分享', searchComplete: true,
+    shareScanCount: 1, cards: [] });
+  assert.equal(premature.nextList, undefined);
+  assert.equal(app.state.tabContextMap[9].listTarget, '待分享');
+  const final = await app.message({ type: 'm2_orderCandidates', purchaseId: 'P-1', listTarget: '待分享', searchComplete: true,
+    shareScanCount: 4, cards: [] });
+  assert.equal(final.nextList, '待发货');
+  assert.match(app.state.m2Purchases[0].collection.reason, /查看4次/);
 });
 
 test('a non-collector detail cannot save an amount for a different order', async () => {

@@ -267,9 +267,17 @@
           if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') continue;
           if (el.shadowRoot) {
             collect(el.shadowRoot);
-          } else if (el.children.length === 0) {
-            const t = (el.textContent || '').trim();
-            if (t) texts.push(t);
+          } else {
+            let hasOwnText = false;
+            for (const node of el.childNodes || []) {
+              if (node.nodeType !== 3) continue;
+              const t = (node.textContent || '').trim();
+              if (t) { texts.push(t); hasOwnText = true; }
+            }
+            if (!hasOwnText && el.children.length === 0) {
+              const t = (el.textContent || '').trim();
+              if (t) texts.push(t);
+            }
           }
         }
       } catch (e) {}
@@ -423,8 +431,7 @@
     const myCtxEarly = await getMyContext();
     if (myCtxEarly && myCtxEarly.purpose === 'collect_orders') {
       window.__m2MainDone = true;
-      if (typeof M2Discovery !== 'undefined' && M2Discovery.runCollect) await M2Discovery.runCollect(myCtxEarly);
-      if (isOrderDetailPage() || isSuccessPage()) await collectOrderResult(platform);
+      await collectPendingOrders(myCtxEarly);
       return;
     }
     const targetSn = myCtxEarly && myCtxEarly.platformOrderSn;
@@ -621,22 +628,40 @@
     }
   }, 500);
 
-  // 采集页会先停在待发货。点完待分享后页面不刷新，所以要继续点、继续读，并在订单详情里取出单号。
-  setInterval(async () => {
+  // DOM 就绪和页面显示事件会立即推进查单；定时器仅作为兜底。
+  async function collectPendingOrders(knownContext) {
     if (detectPlatform() !== 'PINDUODUO') return;
     if (window.__m2CollectDone || window.__m2CollectRunning) return;
-    const ctx = await getMyContext();
-    if (!ctx || ctx.purpose !== 'collect_orders') return;
     window.__m2CollectRunning = true;
     try {
+      const ctx = knownContext || await getMyContext();
+      if (!ctx || ctx.purpose !== 'collect_orders') return;
+      if (ctx.collectionFinished) { window.__m2CollectDone = true; return; }
       if (typeof M2Discovery !== 'undefined' && M2Discovery.runCollect) await M2Discovery.runCollect(ctx);
-      if (isOrderDetailPage() || isSuccessPage()) await collectOrderResult('PINDUODUO');
+      if (document.hidden !== true && (isOrderDetailPage() || isSuccessPage())) await collectOrderResult('PINDUODUO');
     } catch (e) {
       console.error('[M2] 订单采集错误:', e);
     } finally {
       window.__m2CollectRunning = false;
     }
-  }, 700);
+  }
+  setInterval(collectPendingOrders, 700);
+
+  let eventScanQueued = false;
+  function collectOnPageChange() {
+    if (window.__m2CollectDone || eventScanQueued || detectPlatform() !== 'PINDUODUO') return;
+    if (!/\/(?:orders|order|personal|index)\.html$/.test(window.location.pathname)) return;
+    eventScanQueued = true;
+    Promise.resolve().then(function () {
+      eventScanQueued = false;
+      return collectPendingOrders();
+    }).catch(function (e) { console.error('[M2] 页面变化采集错误:', e); });
+  }
+  if (typeof MutationObserver !== 'undefined' && (document.documentElement || document.body)) {
+    new MutationObserver(collectOnPageChange).observe(document.documentElement || document.body,
+      { childList: true, subtree: true, characterData: true });
+  }
+  if (document.addEventListener) document.addEventListener('visibilitychange', collectOnPageChange);
 
   // 持续监控 2：付款成功后 SPA 跳到订单详情页/成功页，自动提取订单号 + 运输单号
   setInterval(async () => {

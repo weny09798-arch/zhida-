@@ -21,7 +21,8 @@ async function run(document, options = {}) {
     chrome: global.chrome, sessionStorage: global.sessionStorage, MouseEvent: global.MouseEvent,
     DateNow: Date.now,
   };
-  const state = { href: options.initialHref || LIST_URL, messages: [], now: 1000 };
+  const state = { href: options.initialHref || LIST_URL, messages: [], now: 1000,
+    reloadCount: 0, reload() { this.reloadCount++; } };
   const map = new Map();
   Object.assign(global, {
     document,
@@ -55,6 +56,13 @@ function collect(overrides = {}) {
   return discovery.runCollect(Object.assign({ purchaseId: 'purchase-1', listTarget: '待分享', progress: {} }, overrides));
 }
 
+async function finishShareScans(state, overrides = {}) {
+  for (let i = 0; i < 4; i++) {
+    state.now += 10000;
+    await collect(overrides);
+  }
+}
+
 test('runCollect follows the only safe order detail link and reports entry progress', async () => {
   const document = page([card('<a href="' + DETAIL_URL + '">牙签蛋糕 ×1</a>')]);
   await run(document, { exercise: async state => {
@@ -70,8 +78,9 @@ test('runCollect skips a sole card whose order number belongs to an earlier purc
   const document = page([card('<a href="https://mobile.yangkeduo.com/order.html?order_sn=' + previousOrderSn + '">牙签蛋糕 ×1</a>')]);
   await run(document, { exercise: async state => {
     await collect({ claimedOrderSns: [previousOrderSn] });
+    await finishShareScans(state, { claimedOrderSns: [previousOrderSn] });
     assert.equal(state.href, LIST_URL);
-    assert.equal(state.messages.some(message => message.type === 'm2_collectionProgress'), false);
+    assert.equal(state.messages.some(message => message.type === 'm2_collectionProgress' && message.stage === 'entering_detail'), false);
     assert.equal(state.messages.some(message => message.type === 'm2_orderCandidates'), true);
   } });
 });
@@ -116,12 +125,125 @@ test('runCollect clicks a linkless product image once and waits for route progre
   } });
 });
 
-test('runCollect reports empty candidates without throwing when the list has no entry', async () => {
+test('a linkless share card opens its product even when status and paid amount share an inner block', async () => {
+  const document = page(['<div class="order-card"><div class="summary">待分享，差1人 实付 ¥0.7</div><div class="product"><img alt="牙签旗帜">牙签旗帜 ×1</div><button>邀请好友拼单</button></div>']);
+  let clicks = 0;
+  document.querySelector('img').click = () => { clicks++; };
+  await run(document, { exercise: async state => {
+    await collect({ paymentMinor: 70 });
+    assert.equal(clicks, 1);
+    assert.equal(state.messages.some(message => message.type === 'm2_orderCandidates'), false);
+    const candidate = state.messages.find(message => message.type === 'm2_collectionProgress').candidate;
+    assert.equal(candidate.payMinor, 70);
+    assert.equal(candidate.uniquePaidCard, true);
+  } });
+});
+
+test('two linkless share cards with the same paid amount are not guessed from the list', async () => {
+  const document = page([
+    '<div class="order-card"><div>待分享，差1人 实付 ¥0.7</div><img alt="商品甲"></div>',
+    '<div class="order-card"><div>待分享，差1人 实付 ¥0.7</div><img alt="商品乙"></div>',
+  ]);
+  let clicks = 0;
+  for (const image of document.querySelectorAll('img')) image.click = () => { clicks++; };
+  await run(document, { exercise: async state => {
+    await collect({ paymentMinor: 70 });
+    await finishShareScans(state, { paymentMinor: 70 });
+    assert.equal(clicks, 0);
+    assert.equal(state.messages.some(message => message.type === 'm2_orderCandidates'), true);
+  } });
+});
+
+test('an unreadable paid share card is reported instead of being treated as an empty list', async () => {
+  const document = page(['<div class="order-card"><div>待分享，差1人 实付 ¥0.7</div><div>牙签旗帜</div></div>']);
+  await run(document, { candidateResponse: { ok: true, status: 'unreadable' }, exercise: async state => {
+    await collect({ paymentMinor: 70 });
+    await finishShareScans(state, { paymentMinor: 70 });
+    const report = state.messages.find(message => message.type === 'm2_orderCandidates');
+    assert.equal(report.hasVisiblePaidCard, true);
+    assert.equal(state.messages.some(message => message.type === 'm2_collectionPaused'), false);
+  } });
+});
+
+test('an unrendered share list is refreshed three times before it can be declared empty', async () => {
   const document = page([]);
   await run(document, { exercise: async state => {
-    for (let i = 0; i < 4; i++) await collect();
-    assert.equal(state.messages.some(m => m.type === 'm2_orderCandidates' && m.cards.length === 0 && /未找到|没有|加载/.test(m.reason)), true);
-    assert.equal(state.messages.some(m => m.type === 'm2_collectionPaused'), false);
+    await collect({ paymentMinor: 60 });
+    assert.equal(state.messages.some(m => m.type === 'm2_orderCandidates'), false);
+    for (let i = 1; i <= 3; i++) {
+      state.now += 10000;
+      await collect({ paymentMinor: 60 });
+      assert.equal(state.reloadCount, i);
+      assert.equal(state.messages.some(m => m.type === 'm2_orderCandidates'), false);
+    }
+    state.now += 10000;
+    await collect({ paymentMinor: 60 });
+    const reports = state.messages.filter(m => m.type === 'm2_orderCandidates');
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].shareScanCount, 4);
+  } });
+});
+
+test('a different paid share card does not trigger an immediate switch to unshipped orders', async () => {
+  const document = page(['<div class="order-card"><div>待分享，差1人</div><img alt="旧商品"><div>实付 ￥0.7</div></div>']);
+  await run(document, { candidateResponse: { ok: true, status: 'share_pending', nextList: '待发货' }, exercise: async state => {
+    await collect({ paymentMinor: 60 });
+    assert.equal(state.messages.some(m => m.type === 'm2_orderCandidates'), false);
+    assert.equal(state.href, LIST_URL);
+    state.now += 10000;
+    await collect({ paymentMinor: 60 });
+    assert.equal(state.reloadCount, 1);
+    document.body.insertAdjacentHTML('beforeend', '<div class="order-card"><div>待分享，差1人</div><img alt="新商品"><div>菜品牙签小插旗 ×1</div><div>实付 ￥0.6</div></div>');
+    let clicked = 0;
+    document.querySelector('img[alt="新商品"]').click = () => { clicked++; };
+    await collect({ paymentMinor: 60 });
+    assert.equal(clicked, 1);
+    assert.equal(state.messages.some(m => m.type === 'm2_orderCandidates'), false);
+  } });
+});
+
+test('a share list still loading after repeated refreshes pauses instead of switching lists', async () => {
+  const document = page(['<div>正在加载中</div>']);
+  await run(document, { exercise: async state => {
+    await collect({ paymentMinor: 60 });
+    await finishShareScans(state, { paymentMinor: 60 });
+    assert.equal(state.messages.some(m => m.type === 'm2_orderCandidates'), false);
+    assert.equal(state.messages.some(m => m.type === 'm2_collectionPaused' && /待分享.*加载/.test(m.reason)), true);
+  } });
+});
+
+test('a delayed share card is opened instead of reporting an empty list during rendering', async () => {
+  const document = page([]);
+  await run(document, { exercise: async state => {
+    for (let i = 0; i < 5; i++) {
+      state.now += 700;
+      await collect({ paymentMinor: 60 });
+    }
+    assert.equal(state.messages.some(message => message.type === 'm2_orderCandidates'), false);
+    document.body.insertAdjacentHTML('beforeend', '<div class="order-card"><div class="summary">待分享，差1人</div><div class="product"><img alt="牙签旗帜">菜品牙签小插旗 ×1</div><div>实付 ￥0.6</div></div>');
+    let clicks = 0;
+    document.querySelector('img').click = () => { clicks++; };
+    await collect({ paymentMinor: 60 });
+    assert.equal(clicks, 1);
+  } });
+});
+
+test('hidden time does not exhaust share scans or click a page that is not displayed', async () => {
+  const document = page([card('牙签蛋糕 ×1 <img alt="牙签蛋糕">')]);
+  Object.defineProperty(document, 'hidden', { value: true, writable: true });
+  let clicks = 0;
+  document.querySelector('img').click = () => { clicks++; };
+  await run(document, { exercise: async state => {
+    await collect({ paymentMinor: 61 });
+    state.now += 60000;
+    await collect({ paymentMinor: 61 });
+    assert.equal(clicks, 0);
+    assert.equal(state.reloadCount, 0);
+    assert.equal(state.messages.some(m => m.type === 'm2_orderCandidates' || m.type === 'm2_collectionPaused'), false);
+    assert.equal(state.messages.some(m => m.type === 'm2_collectorNeedsVisibility'), true);
+    document.hidden = false;
+    await collect({ paymentMinor: 61 });
+    assert.equal(clicks, 1);
   } });
 });
 
@@ -140,6 +262,7 @@ test('runCollect does not choose the first of indistinguishable cards', async ()
   const document = page([card('<a href="' + DETAIL_URL + '">牙签蛋糕 ×1</a>'), card('<a href="https://mobile.yangkeduo.com/order.html?order_sn=other">牙签蛋糕 ×1</a>')]);
   await run(document, { exercise: async state => {
     await collect();
+    await finishShareScans(state);
     assert.equal(state.href, LIST_URL);
     assert.equal(state.messages.some(m => m.type === 'm2_orderCandidates' && m.cards.length === 2), true);
     assert.equal(state.messages.some(m => m.type === 'm2_collectionPaused'), false);
@@ -196,15 +319,17 @@ test('runCollect preserves an awaiting-choice candidate result', async () => {
   const document = page([card('<a href="' + DETAIL_URL + '">牙签蛋糕 ×1</a>'), card('<a href="https://mobile.yangkeduo.com/order.html?order_sn=other">牙签蛋糕 ×1</a>')]);
   await run(document, { candidateResponse: { ok: true, status: 'choose' }, exercise: async state => {
     await collect();
+    await finishShareScans(state);
     assert.equal(state.messages.filter(m => m.type === 'm2_orderCandidates').length, 1);
     assert.equal(state.messages.some(m => m.type === 'm2_collectionPaused'), false);
   } });
 });
 
 test('runCollect reports the background error when candidates cannot be saved', async () => {
-  const document = page([]);
+  const document = page(['<div class="order-card">待分享，差1人 实付 ¥0.61</div>']);
   await run(document, { candidateResponse: { ok: false, error: '候选保存失败' }, exercise: async state => {
-    for (let i = 0; i < 4; i++) await collect();
+    await collect();
+    await finishShareScans(state);
     assert.equal(state.messages.some(m => m.type === 'm2_collectionPaused' && /候选保存失败/.test(m.reason)), true);
   } });
 });
