@@ -9,7 +9,8 @@ importScripts('purchase-store.js', 'binding-store.js', 'sync-queue.js', 'zhida-a
 
 const BASE = 'https://zhida.shopeeok.com/agent-foreign';
 const VERSION = chrome.runtime.getManifest().version;
-const LOGISTICS_INTERVAL_MS = 2 * 60 * 60 * 1000;
+const LOGISTICS_INTERVAL_MS = 30 * 60 * 1000;
+const ORDER_LOOKUP_WINDOW_MS = 2 * 60 * 1000;
 
 // 统一请求封装：cookie 认证 + token（token_hook.js 存到 storage）
 async function apiRequest(path, { method = 'GET', params = {}, body } = {}) {
@@ -149,6 +150,23 @@ function orderCollectionComplete(row) {
   return !!(row && row.platformOrderSn && (row.logisticsSync === 'confirmed'
     || (row.amount && row.amount.minor != null && Number.isFinite(Number(row.amount.minor)))));
 }
+function orderLookupAllowed(row, now) {
+  const session = row && row.lookupSession;
+  return !!(session && session.id && session.startedAt <= now && session.expiresAt > now);
+}
+function collectorSessionStopped(ctx, row, now) {
+  return !orderLookupAllowed(row, now) || (ctx.foregroundManaged
+    && ctx.lookupSessionId !== row.lookupSession.id);
+}
+async function pauseExpiredLookup(row) {
+  if (!row || orderCollectionComplete(row) || orderLookupAllowed(row, Date.now())) return;
+  if (!orderCollectionPaused(row) && (row.paymentReceipt || row.platformOrderSn)) {
+    await purchaseStore.saveCandidates(row.purchaseId, row.candidates || [], 'paused',
+      '本轮自动查单已结束，已停止切换页面。需要继续查找时请点击重试补采', row.collection && row.collection.listTarget);
+  }
+  await syncQueue.pause('order_identity:' + row.purchaseId, '查单已过期，等待重试补采');
+  await syncQueue.pause('order_detail:' + row.purchaseId, '查单已过期，等待重试补采');
+}
 function orderCollectionPaused(row) {
   const stage = row && row.collection && row.collection.stage;
   return !!(row && (row.status === 'awaiting_login'
@@ -214,9 +232,11 @@ function activateCollector(tabId, purchaseId) {
     const stored = await chrome.storage.local.get('m2SyncTasks');
     const task = collectorTask(ctx, row, stored.m2SyncTasks);
     if (!row || orderCollectionComplete(row) || orderCollectionPaused(row)
+      || collectorSessionStopped(ctx, row, Date.now())
       || !task || task.status !== 'leased' || !task.leaseUntil || task.leaseUntil <= Date.now()) {
       await rememberTab(tabId, Object.assign({}, ctx, { collectionFinished: true }));
       await settleOrderCollection(row, purchaseId);
+      await pauseExpiredLookup(row);
       return { ok: false, error: '这一轮查单已经结束，不再切换页面' };
     }
     const tab = await chrome.tabs.get(tabId);
@@ -447,8 +467,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const row = await purchaseStore.get(ctx.purchaseId);
           const tasks = await chrome.storage.local.get('m2SyncTasks');
           if (!row || orderCollectionComplete(row) || orderCollectionPaused(row)
+            || collectorSessionStopped(ctx, row, Date.now())
             || collectorQueueStopped(ctx, row, tasks.m2SyncTasks)) {
             await settleOrderCollection(row, ctx.purchaseId);
+            await pauseExpiredLookup(row);
             await finishCollector(tabId);
             ctx.collectionFinished = true;
             await rememberTab(tabId, ctx);
@@ -473,7 +495,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         await purchaseStore.markSubmitted(purchaseId);
-        await syncQueue.schedule({ id: 'order_identity:' + purchaseId, purchaseId: purchaseId, kind: 'order_identity', nextAt: Date.now() });
         sendResponse({ ok: true, purchaseId: purchaseId });
       } catch (err) {
         sendResponse({ ok: false, error: err && err.message ? err.message : String(err) });
@@ -516,7 +537,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         if (msg.result && msg.result.status === 'succeeded') {
           const purchase = await purchaseStore.get(resolved.purchaseId);
-          if (purchase && !purchase.platformOrderSn) await kickOrderLookup(resolved.purchaseId);
+          if (purchase && !purchase.platformOrderSn) {
+            if (!saved.duplicate) await purchaseStore.startLookupSession(resolved.purchaseId, 'payment', ORDER_LOOKUP_WINDOW_MS);
+            await kickOrderLookup(resolved.purchaseId);
+          }
         }
         sendResponse({ ok: true, purchaseId: resolved.purchaseId, duplicate: !!saved.duplicate });
       } catch (err) {
@@ -536,6 +560,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         const purchase = await purchaseStore.get(purchaseId);
+        if (!purchase || collectorSessionStopped(tabCtx, purchase, Date.now())) {
+          sendResponse({ ok: false, error: '这张页面属于已结束的查单，请点击重试补采' });
+          return;
+        }
         const claimed = (await purchaseStore.list()).map(function (row) { return row.platformOrderSn; }).filter(Boolean);
         const result = M2Discovery.matchCandidates(purchase.purchaseIntent || {}, msg.cards || [], {
           searchComplete: !!msg.searchComplete && !msg.limitReached,
@@ -631,6 +659,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: '采集页没有对上采购记录' });
           return;
         }
+        const purchase = await purchaseStore.get(msg.purchaseId);
+        if (!purchase || orderCollectionComplete(purchase) || collectorSessionStopped(tabCtx, purchase, Date.now())) {
+          sendResponse({ ok: false, error: '这张页面属于已结束的查单' });
+          return;
+        }
         if (msg.candidate && msg.candidate.orderSn) {
           const owners = await purchaseStore.findByPlatformOrder('PINDUODUO', msg.candidate.orderSn);
           if (owners.some(function (row) { return row.purchaseId !== msg.purchaseId; })) {
@@ -655,7 +688,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const tabCtx = await readTabContext(sender && sender.tab && sender.tab.id);
         const purchaseId = tabCtx && tabCtx.purchaseId;
         const purchase = purchaseId ? await purchaseStore.get(purchaseId) : null;
-        if (!purchaseId || tabCtx.collectionFinished || orderCollectionComplete(purchase)) {
+        if (!purchaseId || tabCtx.collectionFinished || orderCollectionComplete(purchase)
+          || collectorSessionStopped(tabCtx, purchase, Date.now())) {
           sendResponse({ ok: false, error: '没有对应的采购' });
           return;
         }
@@ -683,6 +717,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         await syncQueue.confirm('order_identity:' + msg.purchaseId);
+        await purchaseStore.startLookupSession(msg.purchaseId, 'choose_order', ORDER_LOOKUP_WINDOW_MS);
         await syncQueue.schedule({ id: 'order_detail:' + msg.purchaseId, purchaseId: msg.purchaseId, kind: 'order_detail', nextAt: Date.now() });
         sendResponse({ ok: true, purchaseId: msg.purchaseId });
       } catch (err) {
@@ -717,6 +752,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         await purchaseStore.saveCandidates(purchase.purchaseId, [],
           purchase.platformOrderSn ? 'order_linked' : 'awaiting_order_detail', '正在重新查找采购订单', '待分享');
+        await purchaseStore.startLookupSession(purchase.purchaseId, 'retry', ORDER_LOOKUP_WINDOW_MS);
         const again = await syncQueue.requeue(id, Date.now());
         if (!again) await syncQueue.schedule({ id: id, purchaseId: purchase.purchaseId, kind: kind, nextAt: Date.now() });
         await autoCollect();
@@ -1034,6 +1070,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: '这个采购订单号对不上，或已经属于另一单' });
           return;
         }
+        await purchaseStore.startLookupSession(msg.purchaseId, 'confirm_order', ORDER_LOOKUP_WINDOW_MS);
         await syncQueue.schedule({
           id: 'order_detail:' + msg.purchaseId,
           purchaseId: msg.purchaseId,
@@ -1109,7 +1146,8 @@ async function takePaymentTab(tabId) {
 
 async function kickOrderLookup(purchaseId) {
   const purchase = await purchaseStore.get(purchaseId);
-  if (!purchase || purchase.platformOrderSn || orderCollectionPaused(purchase)) return;
+  if (!purchase || purchase.platformOrderSn || orderCollectionPaused(purchase)
+    || !orderLookupAllowed(purchase, Date.now())) return;
   if (purchase.platform && purchase.platform !== 'PINDUODUO') return;
   const stored = await chrome.storage.local.get('tabContextMap');
   const map = stored.tabContextMap || {};
@@ -1120,7 +1158,8 @@ async function kickOrderLookup(purchaseId) {
     if (!ctx || ctx.purchaseId !== purchaseId || ctx.purpose !== 'collect_orders') continue;
     try {
       const tab = await chrome.tabs.get(Number(id));
-      if (tab && !ctx.collectionFinished && Date.now() - (ctx.lastProgressAt || ctx.createdAt || 0) < 45000) {
+      if (tab && !ctx.collectionFinished && !collectorSessionStopped(ctx, purchase, Date.now())
+        && Date.now() - (ctx.lastProgressAt || ctx.createdAt || 0) < 45000) {
         already = true;
         continue;
       }
@@ -1148,14 +1187,22 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       delete map[String(tabId)];
       await chrome.storage.local.set({ tabContextMap: map });
       const row = await purchaseStore.get(ctx.purchaseId);
-      if (row && !ctx.collectionFinished && !row.platformOrderSn && !orderCollectionPaused(row)) {
+      if (row && !ctx.collectionFinished && !row.platformOrderSn && !orderCollectionPaused(row)
+        && orderLookupAllowed(row, Date.now())) {
         const due = Date.now() + 15000;
         await syncQueue.retry('order_identity:' + ctx.purchaseId, due, '采集页已关闭');
         await scheduleLookupWake(due);
       }
     }
     const purchaseId = await takePaymentTab(tabId);
-    if (purchaseId) await kickOrderLookup(purchaseId);
+    if (purchaseId) {
+      const row = await purchaseStore.get(purchaseId);
+      const submittedAt = row && row.purchaseIntent && row.purchaseIntent.submittedAt;
+      if (row && !row.lookupSession && submittedAt && Date.now() - submittedAt < ORDER_LOOKUP_WINDOW_MS) {
+        await purchaseStore.startLookupSession(purchaseId, 'payment_closed', ORDER_LOOKUP_WINDOW_MS);
+      }
+      await kickOrderLookup(purchaseId);
+    }
   })().catch(function () {});
 });
 
@@ -1251,8 +1298,10 @@ async function reconcileCollectorTabs(now) {
     if (ctx.collectionFinished) continue;
     const row = await purchaseStore.get(ctx.purchaseId);
     if (!row || orderCollectionComplete(row) || orderCollectionPaused(row)
+      || collectorSessionStopped(ctx, row, now)
       || collectorQueueStopped(ctx, row, stored.m2SyncTasks)) {
       await settleOrderCollection(row, ctx.purchaseId);
+      await pauseExpiredLookup(row);
       await finishCollector(Number(id));
       await rememberTab(Number(id), Object.assign({}, ctx, { collectionFinished: true }));
       continue;
@@ -1292,9 +1341,9 @@ async function autoCollect() {
   try {
     const now = Date.now();
     const logisticsSettings = await chrome.storage.local.get('m2LogisticsIntervalVersion');
-    if (logisticsSettings.m2LogisticsIntervalVersion !== 2) {
-      await syncQueue.postponeLogistics(now + LOGISTICS_INTERVAL_MS);
-      await chrome.storage.local.set({ m2LogisticsIntervalVersion: 2 });
+    if (logisticsSettings.m2LogisticsIntervalVersion !== 3) {
+      await syncQueue.shortenLogistics(now + LOGISTICS_INTERVAL_MS);
+      await chrome.storage.local.set({ m2LogisticsIntervalVersion: 3 });
     }
     const activeTasks = await reconcileCollectorTabs(now);
     await syncQueue.releaseExpired(now);
@@ -1302,6 +1351,14 @@ async function autoCollect() {
     for (const row of rows) {
       if (row.platform && row.platform !== 'PINDUODUO') continue;
       const stage = row.collection && row.collection.stage;
+      // 物流闹钟可以查询物流，但不能授权历史记录重新抢占前台。
+      if (row.platformOrderSn && row.logisticsSync !== 'confirmed' && row.status !== 'needs_review' && row.status !== 'awaiting_login') {
+        await syncQueue.schedule({ id: 'logistics:' + row.purchaseId, purchaseId: row.purchaseId, kind: 'logistics', nextAt: now + LOGISTICS_INTERVAL_MS });
+      }
+      if (!orderCollectionComplete(row) && !orderLookupAllowed(row, now)) {
+        await pauseExpiredLookup(row);
+        continue;
+      }
       if (stage === 'awaiting_choice' && row.collection.reason === '订单详情已打开，请核对后点选对应订单'
           && !row.platformOrderSn && row.paymentReceipt
           && row.paymentReceipt.status === 'succeeded' && row.candidates && row.candidates.length === 1) {
@@ -1327,9 +1384,6 @@ async function autoCollect() {
         await syncQueue.schedule({ id: 'order_identity:' + row.purchaseId, purchaseId: row.purchaseId, kind: 'order_identity', nextAt: now });
         continue;
       }
-      if (row.platformOrderSn && row.logisticsSync !== 'confirmed' && row.status !== 'needs_review') {
-        await syncQueue.schedule({ id: 'logistics:' + row.purchaseId, purchaseId: row.purchaseId, kind: 'logistics', nextAt: now + LOGISTICS_INTERVAL_MS });
-      }
       if (row.platformOrderSn && !orderCollectionComplete(row)) {
         await syncQueue.schedule({ id: 'order_detail:' + row.purchaseId, purchaseId: row.purchaseId, kind: 'order_detail', nextAt: now });
       }
@@ -1347,6 +1401,10 @@ async function autoCollect() {
         }
         if (orderCollectionPaused(row)) {
           await syncQueue.pause(task.id, row.collection && row.collection.reason || '等待重试');
+          continue;
+        }
+        if (!orderLookupAllowed(row, now)) {
+          await pauseExpiredLookup(row);
           continue;
         }
       }
@@ -1403,6 +1461,7 @@ async function autoCollect() {
         await rememberTab(tab.id, {
           purchaseId: row.purchaseId,
           taskId: task.id,
+          lookupSessionId: row.lookupSession && row.lookupSession.id,
           purpose: purpose,
           shopeeOrder: {
             orderSn: row.orderSn,

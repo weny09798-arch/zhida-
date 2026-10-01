@@ -56,6 +56,8 @@ function seedPurchase(overrides = {}) {
     purchaseId: 'P-1', orderSn: 'S-1', itemId: 'I-1', modelId: '', platform: 'PINDUODUO',
     status: 'opened', collection: { stage: 'submitted', updatedAt: 1 }, paymentReceipt: null,
     platformOrderSn: null, purchaseIntent: { goodsId: '123', quantity: 1 }, candidates: [],
+    // 默认夹具代表正在执行的新查单；历史记录测试显式移除或过期该会话。
+    lookupSession: { id: 'LIVE', source: 'retry', startedAt: Date.now(), expiresAt: Date.now() + 120000 },
     logisticsSync: 'none', amountSync: 'local', ...overrides,
   };
 }
@@ -65,6 +67,107 @@ function seed(row = seedPurchase(), extra = {}) {
     bindingMap: { 'I-1': [{ id: 'B-1' }] }, tabContextMap: { 9: { purchaseId: 'P-1', platform: 'PINDUODUO' } },
     m2SyncTasks: [], ...extra,
   };
+}
+
+test('a periodic scan does not revive a historical purchase just because it lacks an order number', async () => {
+  const row = seedPurchase({ paymentReceipt: { status: 'succeeded', amountMinor: 60, observedAt: Date.now() - 86400000 },
+    collection: { stage: 'incomplete', updatedAt: Date.now() - 86400000 }, lookupSession: null });
+  const app = harness(seed(row, { m2SyncTasks: [{ id: 'order_identity:P-1', purchaseId: 'P-1', kind: 'order_identity', status: 'pending', nextAt: 0 }] }));
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.created.length, 0);
+  assert.equal(app.tabs.get(9).active, true);
+  assert.equal(app.state.m2SyncTasks[0].status, 'paused');
+});
+
+test('an old order with a missing amount does not turn a logistics alarm into foreground order search', async () => {
+  const row = seedPurchase({ platformOrderSn: 'PDD-123', lookupSession: null, amount: null });
+  const app = harness(seed(row, { m2LogisticsIntervalVersion: 3, m2SyncTasks: [
+    { id: 'order_detail:P-1', purchaseId: 'P-1', kind: 'order_detail', status: 'pending', nextAt: 0 },
+    { id: 'logistics:P-1', purchaseId: 'P-1', kind: 'logistics', status: 'pending', nextAt: 0 },
+  ] }));
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.created.length, 1);
+  assert.equal(app.created[0].active, false);
+  assert.match(app.created[0].url, /goods_express/);
+  assert.equal(app.tabs.get(9).active, true);
+});
+
+test('recent page activity cannot extend an expired foreground lookup', async () => {
+  const row = seedPurchase({ lookupSession: { id: 'OLD', startedAt: Date.now() - 180000, expiresAt: Date.now() - 60000, source: 'payment' } });
+  const app = harness(seed(row, { tabContextMap: { 77: { purchaseId: 'P-1', purpose: 'collect_orders', foregroundManaged: true,
+    lookupSessionId: 'OLD', taskId: 'order_identity:P-1', lastProgressAt: Date.now(), returnTabId: 9 } },
+    m2SyncTasks: [{ id: 'order_identity:P-1', purchaseId: 'P-1', kind: 'order_identity', status: 'leased', leaseUntil: Date.now() + 120000, nextAt: 0 }],
+  }));
+  app.tabs.set(77, { id: 77, windowId: 1, active: false, url: 'https://mobile.yangkeduo.com/orders.html?type=5' });
+  const result = await app.message({ type: 'm2_collectorNeedsVisibility', purchaseId: 'P-1' }, { id: 77 });
+  assert.equal(result.ok, false);
+  assert.equal(app.tabs.get(9).active, true);
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.created.length, 0);
+  assert.equal(app.state.m2SyncTasks[0].status, 'paused');
+});
+
+test('a duplicate result from an old payment page cannot renew an expired lookup', async () => {
+  const row = seedPurchase({ paymentReceipt: { status: 'succeeded', amountMinor: 60, observedAt: Date.now() - 86400000 },
+    lookupSession: { id: 'OLD', startedAt: Date.now() - 180000, expiresAt: Date.now() - 60000, source: 'payment' } });
+  const app = harness(seed(row));
+  await app.message({ type: 'm2_paymentResult', result: { status: 'succeeded', amountMinor: 60 } });
+  assert.equal(app.created.length, 0);
+  assert.equal(app.state.m2Purchases[0].lookupSession.id, 'OLD');
+});
+
+test('a fresh payment replaces the old session even when its page reported recent progress', async () => {
+  const app = harness(seed(seedPurchase({ lookupSession: { id: 'OLD', startedAt: Date.now() - 180000, expiresAt: Date.now() - 60000 } }), {
+    tabContextMap: { 9: { purchaseId: 'P-1' }, 77: { purchaseId: 'P-1', purpose: 'collect_orders',
+      foregroundManaged: true, lookupSessionId: 'OLD', createdByExtension: true, lastProgressAt: Date.now() } },
+  }));
+  app.tabs.set(77, { id: 77, windowId: 1, active: false, url: 'https://mobile.yangkeduo.com/orders.html?type=5' });
+  await app.message({ type: 'm2_paymentResult', result: { status: 'succeeded', amountMinor: 60 } });
+  assert.equal(app.created.length, 1);
+  assert.equal(app.state.tabContextMap[77], undefined);
+});
+
+test('a submitted checkout cannot start foreground lookup before payment or an explicit retry', async () => {
+  const app = harness(seed(seedPurchase({ collection: { stage: 'idle' }, lookupSession: null })));
+  await app.message({ type: 'm2_purchaseSubmitted', purchaseId: 'P-1' });
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.created.length, 0);
+  assert.equal(app.tabs.get(9).active, true);
+});
+
+test('explicit retry grants a fresh bounded session for an expired purchase', async () => {
+  const row = seedPurchase({ lookupSession: { id: 'OLD', expiresAt: Date.now() - 60000 }, collection: { stage: 'paused' } });
+  const app = harness(seed(row));
+  const now = Date.now();
+  await app.message({ type: 'm2_retryCollection', purchaseId: 'P-1' });
+  assert.equal(app.created.length, 1);
+  const session = app.state.m2Purchases[0].lookupSession;
+  assert.notEqual(session.id, 'OLD');
+  assert.ok(session.expiresAt >= now + 120000 && session.expiresAt < now + 121000);
+  assert.equal(app.state.tabContextMap[app.created[0].id].lookupSessionId, session.id);
+});
+
+for (const type of ['m2_collectionProgress', 'm2_collectionPaused', 'm2_orderCandidates']) {
+  test('a message from the previous lookup cannot alter the new lookup: ' + type, async () => {
+    const row = seedPurchase({ collection: { stage: 'awaiting_order_detail' } });
+    const app = harness(seed(row, { tabContextMap: { 77: { purchaseId: 'P-1', purpose: 'collect_orders',
+      foregroundManaged: true, lookupSessionId: 'OLD', taskId: 'order_identity:P-1', listTarget: '待分享' } } }));
+    app.tabs.set(77, { id: 77, windowId: 1, active: false });
+    const reply = await app.message({ type, purchaseId: 'P-1', stage: 'opening_list', reason: '旧页面超时', cards: [] }, { id: 77 });
+    assert.equal(reply.ok, false);
+    assert.equal(app.state.m2Purchases[0].collection.stage, 'awaiting_order_detail');
+  });
+}
+
+for (const recent of [true, false]) {
+  test('closing a watched payment page ' + (recent ? 'starts a recent purchase lookup' : 'does not revive yesterday’s purchase'), async () => {
+    const row = seedPurchase({ lookupSession: null, purchaseIntent: { submittedAt: Date.now() - (recent ? 10000 : 86400000) } });
+    const app = harness(seed(row, { m2PaymentTabs: { 77: 'P-1' } }));
+    app.handlers.removed(77);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal(app.created.length, recent ? 1 : 0);
+    assert.equal(app.tabs.get(9).active, !recent);
+  });
 }
 
 test('order lookup saves its context before showing the query page automatically', async () => {
@@ -333,7 +436,8 @@ test('a paid order detail reached by this lookup is recorded without another cli
   assert.equal(app.state.m2Purchases[0].platformOrderSn, orderSn);
   assert.equal(app.state.m2Purchases[0].amount.minor, 199);
   const logistics = app.state.m2SyncTasks.find(task => task.id === 'logistics:P-1');
-  assert.ok(logistics.nextAt >= now + 2 * 60 * 60 * 1000);
+  assert.ok(logistics.nextAt >= now + 30 * 60 * 1000);
+  assert.ok(logistics.nextAt < now + 31 * 60 * 1000);
 });
 
 test('a unique paid share card can confirm its order number from the clicked navigation even if detail fails', async () => {
@@ -409,16 +513,56 @@ test('an existing single pending candidate is rechecked and then recorded automa
   assert.equal(app.state.m2Purchases[0].platformOrderSn, orderSn);
 });
 
-test('an existing ten-minute logistics task is postponed to the new two-hour interval', async () => {
+test('an existing two-hour logistics task is brought forward to thirty minutes', async () => {
   const now = Date.now();
   const purchase = seedPurchase({ platformOrderSn: 'PDD-123', logisticsSync: 'not_shipped', amount: { minor: 199 }, collection: { stage: 'amount_confirmed' } });
-  const app = harness(seed(purchase, { m2SyncTasks: [{
-    id: 'logistics:P-1', purchaseId: 'P-1', kind: 'logistics', status: 'pending', nextAt: now + 10 * 60 * 1000,
+  const app = harness(seed(purchase, { m2LogisticsIntervalVersion: 2, m2SyncTasks: [{
+    id: 'logistics:P-1', purchaseId: 'P-1', kind: 'logistics', status: 'pending', nextAt: now + 120 * 60 * 1000,
   }] }));
   app.handlers.alarm({ name: 'autoCollect' });
   await new Promise(resolve => setTimeout(resolve, 40));
-  assert.ok(app.state.m2SyncTasks[0].nextAt >= now + 2 * 60 * 60 * 1000);
+  assert.ok(app.state.m2SyncTasks[0].nextAt >= now + 30 * 60 * 1000);
+  assert.ok(app.state.m2SyncTasks[0].nextAt < now + 31 * 60 * 1000);
   assert.equal(app.created.length, 0);
+  const firstDue = app.state.m2SyncTasks[0].nextAt;
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.state.m2SyncTasks[0].nextAt, firstDue);
+});
+
+test('switching to thirty minutes keeps an earlier logistics check due sooner', async () => {
+  const nextAt = Date.now() + 5 * 60 * 1000;
+  const purchase = seedPurchase({ platformOrderSn: 'PDD-123', amount: { minor: 60 }, collection: { stage: 'amount_confirmed' } });
+  const app = harness(seed(purchase, { m2LogisticsIntervalVersion: 2, m2SyncTasks: [{
+    id: 'logistics:P-1', purchaseId: 'P-1', kind: 'logistics', status: 'pending', nextAt,
+  }] }));
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.state.m2SyncTasks[0].nextAt, nextAt);
+});
+
+test('a due logistics check schedules its next automatic check thirty minutes later', async () => {
+  const now = Date.now();
+  const purchase = seedPurchase({ platformOrderSn: 'PDD-123', amount: { minor: 60 }, collection: { stage: 'amount_confirmed' } });
+  const app = harness(seed(purchase, { m2LogisticsIntervalVersion: 3, m2SyncTasks: [{
+    id: 'logistics:P-1', purchaseId: 'P-1', kind: 'logistics', status: 'pending', nextAt: 0,
+  }] }));
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.equal(app.created.length, 1);
+  assert.equal(app.created[0].active, false);
+  assert.ok(app.state.m2SyncTasks[0].nextAt >= now + 30 * 60 * 1000);
+  assert.ok(app.state.m2SyncTasks[0].nextAt < now + 31 * 60 * 1000);
+});
+
+test('changing the logistics interval leaves paused, confirmed and in-flight tasks alone', async () => {
+  const now = Date.now();
+  const tasks = ['paused', 'confirmed', 'leased'].map((status, index) => ({
+    id: 'logistics:P-' + index, purchaseId: 'P-' + index, kind: 'logistics', status,
+    nextAt: now + 120 * 60 * 1000, leaseUntil: status === 'leased' ? now + 120000 : 0,
+  }));
+  const app = harness(seed(seedPurchase({ collection: { stage: 'idle' } }), {
+    m2LogisticsIntervalVersion: 2, m2SyncTasks: tasks,
+  }));
+  await app.message({ type: 'm2_triggerAutoCollect' });
+  assert.deepEqual(app.state.m2SyncTasks, tasks);
 });
 
 test('a confirmed tracking number stops the pending automatic logistics check', async () => {

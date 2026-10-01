@@ -114,6 +114,7 @@
         productUrl: input.productUrl || '',
         bindingId: input.bindingId || '',
         paymentReceipt: null,
+        lookupSession: null,
         collection: { stage: 'idle', reason: '', updatedAt: now },
         purchaseIntent: null,
         candidates: [],
@@ -205,6 +206,19 @@
           row.updatedAt = Date.now();
           await save(state);
           return row;
+        });
+      },
+
+      startLookupSession: function (purchaseId, source, durationMs) {
+        return run(async function () {
+          const state = await load();
+          const row = state.purchases.find(function (item) { return item.purchaseId === purchaseId; });
+          if (!row) return null;
+          const now = Date.now();
+          row.lookupSession = { id: 'lookup_' + now.toString(36) + Math.random().toString(36).slice(2, 8),
+            source: source, startedAt: now, expiresAt: now + durationMs };
+          await save(state);
+          return row.lookupSession;
         });
       },
 

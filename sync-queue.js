@@ -80,17 +80,14 @@
         });
       },
 
-      postponeLogistics: function (nextAt) {
+      shortenLogistics: function (nextAt) {
         return run(async function () {
           const tasks = await load();
           tasks.forEach(function (task) {
             if (task.kind !== 'logistics' || !String(task.id).startsWith('logistics:')
-                || task.status === 'confirmed' || task.status === 'paused') return;
-            task.nextAt = Math.max(Number(task.nextAt) || 0, nextAt);
-            if (task.status === 'leased') {
-              task.status = 'pending';
-              task.leaseUntil = 0;
-            }
+                || (task.status !== 'pending' && task.status !== 'retrying')) return;
+            // 缩短旧间隔，但保留已经到期或更早安排的检查。
+            task.nextAt = Math.min(Number(task.nextAt) || 0, nextAt);
           });
           await save(tasks);
           return tasks;
